@@ -141,15 +141,19 @@ from vllm_ascend.compilation.acl_graph import (
 )
 from vllm_ascend.compilation.breakable_aclgraph import BreakableACLGraphWrapper
 from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
-from vllm_ascend.core.six_region_kv_cache_layout import (
+from vllm_ascend.core.qwen4_exp_kv_cache_layout import (
     GDN,
     HIDDEN,
     PLE,
     QSA_COMPRESSED,
     QSA_MAIN,
     QSA_RAW,
-    build_six_region_kv_cache_layout,
-    make_contiguous_slab_view,
+    TENSOR1,
+    TENSOR2,
+    TENSOR3,
+    TENSOR4,
+    build_qwen4_exp_kv_cache_layout,
+    make_contiguous_plane_view,
 )
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
@@ -5093,7 +5097,9 @@ class NPUModelRunner(GPUModelRunner):
 
         return dsa_k_tensor, dsa_k_scale_tensor
 
-    def _allocate_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
+    def _allocate_kv_cache_tensors(
+        self, kv_cache_config: KVCacheConfig
+    ) -> dict[str, torch.Tensor | tuple[torch.Tensor, ...]]:
         """
         Initializes the KV cache buffer with the correct size. The buffer needs
         to be reshaped to the desired shape before being used by the models.
@@ -5148,26 +5154,26 @@ class NPUModelRunner(GPUModelRunner):
             self.supports_shared_backing_with_kv_transfer
         )
 
-        six_region_layout = (
+        qwen4_exp_layout = (
             None
             if use_legacy_shared_by_layout
-            else build_six_region_kv_cache_layout(
+            else build_qwen4_exp_kv_cache_layout(
                 kv_cache_config.kv_cache_groups,
                 kv_cache_config.num_blocks,
             )
         )
-        uses_six_region_layout = (
-            six_region_layout is not None
+        uses_qwen4_exp_layout = (
+            qwen4_exp_layout is not None
             and not is_dsv4_main
             and not uses_padded_page_layout
             and supports_shared_backing_with_kv_transfer
         )
-        self._six_region_kv_cache_layout = (
-            six_region_layout if uses_six_region_layout else None
+        self._qwen4_exp_kv_cache_layout = (
+            qwen4_exp_layout if uses_qwen4_exp_layout else None
         )
 
         uses_page_strided_shared_backing = (
-            not uses_six_region_layout
+            not uses_qwen4_exp_layout
             and not is_dsv4_main
             and not uses_padded_page_layout
             and supports_shared_backing_with_kv_transfer
@@ -5178,16 +5184,36 @@ class NPUModelRunner(GPUModelRunner):
         )
         self._page_strided_shared_backing = uses_page_strided_shared_backing
 
-        if uses_six_region_layout:
-            assert six_region_layout is not None
-            backing = self._allocate_int8_cache_tensor(
-                six_region_layout.slot_count
-                * six_region_layout.slot_backing_size,
+        if uses_qwen4_exp_layout:
+            assert qwen4_exp_layout is not None
+            plane_backings = {
+                plane.name: self._allocate_int8_cache_tensor(
+                    qwen4_exp_layout.plane_backing_size(plane.name),
+                    alignment,
+                )
+                for plane in qwen4_exp_layout.planes
+            }
+            ring_backing = self._allocate_int8_cache_tensor(
+                qwen4_exp_layout.ring_backing_size,
                 alignment,
             )
-            for owner in six_region_layout.owners:
-                if owner.role != HIDDEN:
-                    kv_cache_raw_tensors[owner.layer_name] = backing
+            for owner in qwen4_exp_layout.owners:
+                if owner.role == QSA_RAW:
+                    kv_cache_raw_tensors[owner.layer_name] = ring_backing
+                elif owner.role == QSA_MAIN:
+                    kv_cache_raw_tensors[owner.layer_name] = (
+                        plane_backings[TENSOR2],
+                        plane_backings[TENSOR1],
+                    )
+                elif owner.role == QSA_COMPRESSED:
+                    kv_cache_raw_tensors[owner.layer_name] = plane_backings[TENSOR4]
+                elif owner.role == GDN:
+                    kv_cache_raw_tensors[owner.layer_name] = (
+                        plane_backings[TENSOR3],
+                        plane_backings[TENSOR2],
+                    )
+                elif owner.role == PLE:
+                    kv_cache_raw_tensors[owner.layer_name] = plane_backings[TENSOR1]
 
         if uses_page_strided_shared_backing:
             backing_sizes = {
@@ -5295,7 +5321,7 @@ class NPUModelRunner(GPUModelRunner):
         if (
             not is_dsv4_main
             and not uses_padded_page_layout
-            and not uses_six_region_layout
+            and not uses_qwen4_exp_layout
             and self.hybrid_with_attn_and_mamba
             and supports_shared_backing_with_kv_transfer
             and not self.use_sparse
@@ -5537,7 +5563,9 @@ class NPUModelRunner(GPUModelRunner):
     def _reshape_kv_cache_tensors(
         self,
         kv_cache_config: KVCacheConfig,
-        kv_cache_raw_tensors: dict[str, torch.Tensor],
+        kv_cache_raw_tensors: dict[
+            str, torch.Tensor | tuple[torch.Tensor, ...]
+        ],
     ) -> dict[str, torch.Tensor]:
         """
         Reshape the KV cache tensors to the desired shape and dtype.
@@ -5561,9 +5589,9 @@ class NPUModelRunner(GPUModelRunner):
                 for name in descriptor.layers
             }
 
-        six_region_layout = getattr(
+        qwen4_exp_layout = getattr(
             self,
-            "_six_region_kv_cache_layout",
+            "_qwen4_exp_kv_cache_layout",
             None,
         )
         uses_page_strided_shared_backing = getattr(
@@ -5624,20 +5652,18 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     kv_caches[layer_name] = tuple(views) if is_index else views[0]
                     continue
-                if six_region_layout is not None:
-                    owner = six_region_layout.owner(layer_name)
-                    raw_slab = kv_cache_raw_tensors[layer_name]
-                    assert isinstance(raw_slab, torch.Tensor)
-                    slot_offset = (
-                        owner.slot * six_region_layout.slot_backing_size
-                    )
+                if qwen4_exp_layout is not None:
+                    owner = qwen4_exp_layout.owner(layer_name)
+                    raw_allocation = kv_cache_raw_tensors[layer_name]
                     if owner.role == QSA_MAIN:
+                        assert isinstance(raw_allocation, tuple)
+                        k_slab, v_slab = raw_allocation
                         assert isinstance(
                             current_kv_cache_spec,
                             FullAttentionSpec,
                         )
-                        k_cache = make_contiguous_slab_view(
-                            raw_slab,
+                        k_cache = make_contiguous_plane_view(
+                            k_slab,
                             dtype=current_kv_cache_spec.dtype,
                             num_blocks=kv_cache_config.num_blocks,
                             item_shape=(
@@ -5646,12 +5672,12 @@ class NPUModelRunner(GPUModelRunner):
                                 current_kv_cache_spec.head_size,
                             ),
                             storage_offset=(
-                                slot_offset
-                                + six_region_layout.region("r2").offset
+                                owner.slot
+                                * qwen4_exp_layout.plane(TENSOR2).size
                             ),
                         )
-                        v_cache = make_contiguous_slab_view(
-                            raw_slab,
+                        v_cache = make_contiguous_plane_view(
+                            v_slab,
                             dtype=current_kv_cache_spec.dtype,
                             num_blocks=kv_cache_config.num_blocks,
                             item_shape=(
@@ -5660,13 +5686,14 @@ class NPUModelRunner(GPUModelRunner):
                                 current_kv_cache_spec.head_size_v,
                             ),
                             storage_offset=(
-                                slot_offset
-                                + six_region_layout.region("r3").offset
+                                owner.slot
+                                * qwen4_exp_layout.plane(TENSOR1).size
                             ),
                         )
                         kv_caches[layer_name] = (k_cache, v_cache)
                         continue
                     if owner.role in (QSA_RAW, QSA_COMPRESSED):
+                        assert isinstance(raw_allocation, torch.Tensor)
                         assert isinstance(
                             current_kv_cache_spec,
                             AttentionSpec,
@@ -5682,8 +5709,10 @@ class NPUModelRunner(GPUModelRunner):
                             if owner.role == QSA_RAW
                             else current_kv_cache_spec.num_states
                         )
-                        region = six_region_layout.region(
-                            "r4" if owner.role == QSA_RAW else "r5"
+                        page_size_bytes = (
+                            qwen4_exp_layout.ring_page_size_bytes
+                            if owner.role == QSA_RAW
+                            else qwen4_exp_layout.plane(TENSOR4).page_size_bytes
                         )
                         expected_page_bytes = (
                             storage_block_size
@@ -5691,14 +5720,14 @@ class NPUModelRunner(GPUModelRunner):
                             * current_kv_cache_spec.head_size
                             * get_dtype_size(current_kv_cache_spec.dtype)
                         )
-                        if expected_page_bytes != region.page_size_bytes:
+                        if expected_page_bytes != page_size_bytes:
                             raise ValueError(
-                                f"{layer_name} six-region page mismatch: "
+                                f"{layer_name} packed-cache page mismatch: "
                                 f"view={expected_page_bytes}, "
-                                f"region={region.page_size_bytes}."
+                                f"plane={page_size_bytes}."
                             )
-                        kv_caches[layer_name] = make_contiguous_slab_view(
-                            raw_slab,
+                        kv_caches[layer_name] = make_contiguous_plane_view(
+                            raw_allocation,
                             dtype=current_kv_cache_spec.dtype,
                             num_blocks=kv_cache_config.num_blocks,
                             item_shape=(
@@ -5706,47 +5735,58 @@ class NPUModelRunner(GPUModelRunner):
                                 storage_block_size,
                                 current_kv_cache_spec.head_size,
                             ),
-                            storage_offset=slot_offset + region.offset,
+                            storage_offset=(
+                                owner.slot
+                                * qwen4_exp_layout.ring_slot_backing_size
+                                if owner.role == QSA_RAW
+                                else owner.slot
+                                * qwen4_exp_layout.plane(TENSOR4).size
+                            ),
                         )
                         continue
                     if owner.role in (GDN, PLE):
                         assert isinstance(current_kv_cache_spec, MambaSpec)
-                        region_names = {
-                            GDN: ("r1", "r2"),
-                            PLE: ("r6",),
+                        plane_names = {
+                            GDN: (TENSOR3, TENSOR2),
+                            PLE: (TENSOR1,),
                         }[owner.role]
-                        if len(region_names) != len(
+                        if len(plane_names) != len(
                             current_kv_cache_spec.shapes
                         ):
                             raise RuntimeError(
-                                "Invalid six-region Mamba role/shape for "
+                                "Invalid packed-cache Mamba role/shape for "
                                 f"{layer_name}: role={owner.role}, "
                                 f"shapes={current_kv_cache_spec.shapes}."
                             )
+                        if owner.role == GDN:
+                            assert isinstance(raw_allocation, tuple)
+                            state_backings = raw_allocation
+                        else:
+                            assert isinstance(raw_allocation, torch.Tensor)
+                            state_backings = (raw_allocation,)
                         kv_caches[layer_name] = [
-                            make_contiguous_slab_view(
-                                raw_slab,
+                            make_contiguous_plane_view(
+                                backing,
                                 dtype=dtype,
                                 num_blocks=kv_cache_config.num_blocks,
                                 item_shape=tuple(shape),
                                 storage_offset=(
-                                    slot_offset
-                                    + six_region_layout.region(
-                                        region_name
-                                    ).offset
+                                    owner.slot
+                                    * qwen4_exp_layout.plane(plane_name).size
                                 ),
                             )
-                            for shape, dtype, region_name in zip(
+                            for shape, dtype, plane_name, backing in zip(
                                 current_kv_cache_spec.shapes,
                                 current_kv_cache_spec.dtypes,
-                                region_names,
+                                plane_names,
+                                state_backings,
                                 strict=True,
                             )
                         ]
                         continue
                     if owner.role != HIDDEN:
                         raise RuntimeError(
-                            f"Unsupported six-region owner {owner}."
+                            f"Unsupported Qwen4Exp packed-cache owner {owner}."
                         )
 
                 packed_descriptor = packed_descriptors.get(layer_name)
