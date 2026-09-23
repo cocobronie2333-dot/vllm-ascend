@@ -78,7 +78,6 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
-    FullAttentionSpec,
     HiddenStateCacheSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -145,15 +144,9 @@ from vllm_ascend.core.qwen4_exp_kv_cache_layout import (
     GDN,
     HIDDEN,
     PLE,
-    QSA_COMPRESSED,
     QSA_MAIN,
-    QSA_RAW,
-    TENSOR1,
-    TENSOR2,
-    TENSOR3,
-    TENSOR4,
-    build_qwen4_exp_kv_cache_layout,
-    make_contiguous_plane_view,
+    Qwen4ExpKVCachePlanner,
+    make_plane_view,
 )
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
@@ -5157,9 +5150,8 @@ class NPUModelRunner(GPUModelRunner):
         qwen4_exp_layout = (
             None
             if use_legacy_shared_by_layout
-            else build_qwen4_exp_kv_cache_layout(
-                kv_cache_config.kv_cache_groups,
-                kv_cache_config.num_blocks,
+            else Qwen4ExpKVCachePlanner(self.vllm_config).build_physical_plan(
+                kv_cache_config.kv_cache_groups, kv_cache_config.num_blocks
             )
         )
         uses_qwen4_exp_layout = (
@@ -5188,32 +5180,19 @@ class NPUModelRunner(GPUModelRunner):
             assert qwen4_exp_layout is not None
             plane_backings = {
                 plane.name: self._allocate_int8_cache_tensor(
-                    qwen4_exp_layout.plane_backing_size(plane.name),
+                    plane.size,
                     alignment,
                 )
                 for plane in qwen4_exp_layout.planes
             }
-            ring_backing = self._allocate_int8_cache_tensor(
-                qwen4_exp_layout.ring_backing_size,
-                alignment,
-            )
             for owner in qwen4_exp_layout.owners:
-                if owner.role == QSA_RAW:
-                    kv_cache_raw_tensors[owner.layer_name] = ring_backing
-                elif owner.role == QSA_MAIN:
-                    kv_cache_raw_tensors[owner.layer_name] = (
-                        plane_backings[TENSOR2],
-                        plane_backings[TENSOR1],
-                    )
-                elif owner.role == QSA_COMPRESSED:
-                    kv_cache_raw_tensors[owner.layer_name] = plane_backings[TENSOR4]
-                elif owner.role == GDN:
-                    kv_cache_raw_tensors[owner.layer_name] = (
-                        plane_backings[TENSOR3],
-                        plane_backings[TENSOR2],
-                    )
-                elif owner.role == PLE:
-                    kv_cache_raw_tensors[owner.layer_name] = plane_backings[TENSOR1]
+                views = qwen4_exp_layout.owner_views(owner.layer_name)
+                if not views:
+                    continue
+                backings = tuple(plane_backings[view.plane_name] for view in views)
+                kv_cache_raw_tensors[owner.layer_name] = (
+                    backings[0] if len(backings) == 1 else backings
+                )
 
         if uses_page_strided_shared_backing:
             backing_sizes = {
@@ -5654,135 +5633,32 @@ class NPUModelRunner(GPUModelRunner):
                     continue
                 if qwen4_exp_layout is not None:
                     owner = qwen4_exp_layout.owner(layer_name)
-                    raw_allocation = kv_cache_raw_tensors[layer_name]
-                    if owner.role == QSA_MAIN:
-                        assert isinstance(raw_allocation, tuple)
-                        k_slab, v_slab = raw_allocation
-                        assert isinstance(
-                            current_kv_cache_spec,
-                            FullAttentionSpec,
+                    recipes = qwen4_exp_layout.owner_views(layer_name)
+                    if recipes:
+                        raw_allocation = kv_cache_raw_tensors[layer_name]
+                        backings = (
+                            raw_allocation
+                            if isinstance(raw_allocation, tuple)
+                            else (raw_allocation,)
                         )
-                        k_cache = make_contiguous_plane_view(
-                            k_slab,
-                            dtype=current_kv_cache_spec.dtype,
-                            num_blocks=kv_cache_config.num_blocks,
-                            item_shape=(
-                                current_kv_cache_spec.block_size,
-                                current_kv_cache_spec.num_kv_heads,
-                                current_kv_cache_spec.head_size,
-                            ),
-                            storage_offset=(
-                                owner.slot
-                                * qwen4_exp_layout.plane(TENSOR2).size
-                            ),
-                        )
-                        v_cache = make_contiguous_plane_view(
-                            v_slab,
-                            dtype=current_kv_cache_spec.dtype,
-                            num_blocks=kv_cache_config.num_blocks,
-                            item_shape=(
-                                current_kv_cache_spec.block_size,
-                                current_kv_cache_spec.num_kv_heads,
-                                current_kv_cache_spec.head_size_v,
-                            ),
-                            storage_offset=(
-                                owner.slot
-                                * qwen4_exp_layout.plane(TENSOR1).size
-                            ),
-                        )
-                        kv_caches[layer_name] = (k_cache, v_cache)
-                        continue
-                    if owner.role in (QSA_RAW, QSA_COMPRESSED):
-                        assert isinstance(raw_allocation, torch.Tensor)
-                        assert isinstance(
-                            current_kv_cache_spec,
-                            AttentionSpec,
-                        )
-                        # ``tokens_per_state`` is the compressed cache's
-                        # physical row ratio on current vLLM.  The optional
-                        # ``storage_block_size`` field is a view override and
-                        # is normally unset for QSA, so the generic helper
-                        # would incorrectly return the logical 768-token
-                        # scheduler block instead of its 192 stored states.
-                        storage_block_size = (
-                            current_kv_cache_spec.block_size
-                            if owner.role == QSA_RAW
-                            else current_kv_cache_spec.num_states
-                        )
-                        page_size_bytes = (
-                            qwen4_exp_layout.ring_page_size_bytes
-                            if owner.role == QSA_RAW
-                            else qwen4_exp_layout.plane(TENSOR4).page_size_bytes
-                        )
-                        expected_page_bytes = (
-                            storage_block_size
-                            * current_kv_cache_spec.num_kv_heads
-                            * current_kv_cache_spec.head_size
-                            * get_dtype_size(current_kv_cache_spec.dtype)
-                        )
-                        if expected_page_bytes != page_size_bytes:
-                            raise ValueError(
-                                f"{layer_name} packed-cache page mismatch: "
-                                f"view={expected_page_bytes}, "
-                                f"plane={page_size_bytes}."
-                            )
-                        kv_caches[layer_name] = make_contiguous_plane_view(
-                            raw_allocation,
-                            dtype=current_kv_cache_spec.dtype,
-                            num_blocks=kv_cache_config.num_blocks,
-                            item_shape=(
-                                current_kv_cache_spec.num_kv_heads,
-                                storage_block_size,
-                                current_kv_cache_spec.head_size,
-                            ),
-                            storage_offset=(
-                                owner.slot
-                                * qwen4_exp_layout.ring_slot_backing_size
-                                if owner.role == QSA_RAW
-                                else owner.slot
-                                * qwen4_exp_layout.plane(TENSOR4).size
-                            ),
-                        )
-                        continue
-                    if owner.role in (GDN, PLE):
-                        assert isinstance(current_kv_cache_spec, MambaSpec)
-                        plane_names = {
-                            GDN: (TENSOR3, TENSOR2),
-                            PLE: (TENSOR1,),
-                        }[owner.role]
-                        if len(plane_names) != len(
-                            current_kv_cache_spec.shapes
-                        ):
-                            raise RuntimeError(
-                                "Invalid packed-cache Mamba role/shape for "
-                                f"{layer_name}: role={owner.role}, "
-                                f"shapes={current_kv_cache_spec.shapes}."
-                            )
-                        if owner.role == GDN:
-                            assert isinstance(raw_allocation, tuple)
-                            state_backings = raw_allocation
-                        else:
-                            assert isinstance(raw_allocation, torch.Tensor)
-                            state_backings = (raw_allocation,)
-                        kv_caches[layer_name] = [
-                            make_contiguous_plane_view(
+                        materialized = [
+                            make_plane_view(
                                 backing,
-                                dtype=dtype,
-                                num_blocks=kv_cache_config.num_blocks,
-                                item_shape=tuple(shape),
-                                storage_offset=(
-                                    owner.slot
-                                    * qwen4_exp_layout.plane(plane_name).size
-                                ),
+                                plane=qwen4_exp_layout.plane(recipe.plane_name),
+                                slot=recipe.slot,
+                                dtype=recipe.dtype,
+                                item_shape=recipe.item_shape,
                             )
-                            for shape, dtype, plane_name, backing in zip(
-                                current_kv_cache_spec.shapes,
-                                current_kv_cache_spec.dtypes,
-                                plane_names,
-                                state_backings,
-                                strict=True,
+                            for recipe, backing in zip(
+                                recipes, backings, strict=True
                             )
                         ]
+                        if owner.role == QSA_MAIN:
+                            kv_caches[layer_name] = tuple(materialized)
+                        elif owner.role in (GDN, PLE):
+                            kv_caches[layer_name] = materialized
+                        else:
+                            kv_caches[layer_name] = materialized[0]
                         continue
                     if owner.role != HIDDEN:
                         raise RuntimeError(

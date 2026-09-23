@@ -35,6 +35,7 @@ from vllm_ascend.core.qwen4_exp_kv_cache_layout import (
     QSA_COMPRESSED,
     QSA_MAIN,
     QSA_RAW,
+    Qwen4ExpKVCachePlanner,
     build_qwen4_exp_kv_cache_layout,
 )
 from vllm_ascend.models.deepseek_v41.cache_config import (
@@ -997,25 +998,14 @@ def _get_ascend_kv_cache_groups(
 ) -> list[KVCacheGroupSpec]:
     if any(is_glm5_next_cache_spec(spec) for spec in kv_cache_spec.values()):
         return get_glm5_next_kv_cache_groups(vllm_config, kv_cache_spec)
-    qsa_owners = _prepare_qsa_composite_groups(kv_cache_spec)
-    groups = _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
-    groups = _merge_shattered_gdn_groups(kv_cache_spec, groups)
-    if qsa_owners is None:
+    if Qwen4ExpKVCachePlanner.is_applicable(kv_cache_spec):
+        groups = Qwen4ExpKVCachePlanner(vllm_config).get_kv_cache_groups(kv_cache_spec)
+        logger.info(
+            "Using Qwen3.8 component-aware grouping with %d cache groups",
+            len(groups),
+        )
         return groups
-    merged = _merge_qsa_composite_groups(
-        groups,
-        kv_cache_spec,
-        *qsa_owners,
-    )
-    merged = _merge_ple_into_last_gdn_group(merged, kv_cache_spec)
-    merged = _order_qwen4_exp_cache_groups(merged, kv_cache_spec)
-    logger.info(
-        "Using Qwen3.8 packed grouping: %d main/compressed owners, %d raw circular owners, %d total cache groups",
-        len(qsa_owners[0]) + len(qsa_owners[1]),
-        len(qsa_owners[2]),
-        len(merged),
-    )
-    return merged
+    return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
 
 
 def _get_qwen4_exp_kv_cache_config(
@@ -1034,10 +1024,9 @@ def _get_qwen4_exp_kv_cache_config(
     """
     if vllm_version_is("0.28.0"):
         return None
-    probe = build_qwen4_exp_kv_cache_layout(
-        kv_cache_groups,
-        num_blocks=1,
-    )
+    planner = Qwen4ExpKVCachePlanner(vllm_config)
+    resolved_layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
+    probe = planner.build_physical_plan(kv_cache_groups, num_blocks=1, layout=resolved_layout)
     if probe is None:
         return None
 
@@ -1048,10 +1037,7 @@ def _get_qwen4_exp_kv_cache_config(
     bytes_per_block = normal_bytes_per_block + ring_bytes_per_block + hidden_bytes_per_block
     candidate = available_memory // bytes_per_block
     while candidate > 0:
-        candidate_layout = build_qwen4_exp_kv_cache_layout(
-            kv_cache_groups,
-            num_blocks=candidate,
-        )
+        candidate_layout = planner.build_physical_plan(kv_cache_groups, num_blocks=candidate, layout=resolved_layout)
         assert candidate_layout is not None
         required = (
             candidate_layout.normal_backing_size
@@ -1062,68 +1048,16 @@ def _get_qwen4_exp_kv_cache_config(
             break
         candidate -= 1
     num_blocks = may_override_num_blocks(vllm_config, candidate)
-    layout = build_qwen4_exp_kv_cache_layout(
-        kv_cache_groups,
-        num_blocks=num_blocks,
-    )
+    layout = planner.build_physical_plan(kv_cache_groups, num_blocks=num_blocks, layout=resolved_layout)
     assert layout is not None
-    plane_by_role = {
-        QSA_MAIN: "tensor2",
-        QSA_COMPRESSED: "tensor4",
-        GDN: "tensor3",
-        PLE: "tensor1",
-    }
-    tensors: list[KVCacheTensor] = []
-    owner_buckets: list[tuple[str, str, list]] = []
-    for role, plane_name in plane_by_role.items():
-        role_owners = [owner for owner in layout.owners if owner.role == role]
-        for group_id in sorted({owner.group_id for owner in role_owners}):
-            owners = sorted(
-                (owner for owner in role_owners if owner.group_id == group_id),
-                key=lambda owner: owner.slot,
-            )
-            owner_buckets.append((role, plane_name, owners))
-
-    for _, plane_name, owners in owner_buckets:
-        plane = layout.plane(plane_name)
-        tensors.append(
-            KVCacheTensor(
-                size=layout.plane_backing_size(plane_name),
-                layers=[owner.layer_name for owner in owners],
-                layer_stride=plane.size,
-                block_stride=plane.page_size_bytes,
-                offset=0,
-            )
-        )
-    raw_owners = sorted(
-        (owner for owner in layout.owners if owner.role == QSA_RAW),
-        key=lambda owner: owner.slot,
-    )
-    tensors.append(
-        KVCacheTensor(
-            size=layout.ring_backing_size,
-            layers=[owner.layer_name for owner in raw_owners],
-            layer_stride=layout.ring_slot_backing_size,
-            block_stride=layout.ring_page_size_bytes,
-            offset=0,
-        )
-    )
-    tensors.extend(
-        KVCacheTensor(
-            size=owner.spec.page_size_bytes * num_blocks,
-            layers=[owner.layer_name],
-            layer_stride=owner.spec.page_size_bytes * num_blocks,
-            block_stride=owner.spec.page_size_bytes,
-            offset=0,
-        )
-        for owner in hidden_owners
-    )
+    tensors = planner.make_kv_cache_tensors(layout)
 
     return KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=tensors,
         kv_cache_groups=kv_cache_groups,
         prefix_cache_retention_interval=(vllm_config.cache_config.prefix_cache_retention_interval),
+        kv_cache_layout=resolved_layout.name,
     )
 
 

@@ -1,33 +1,27 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
-    KVCacheGroupSpec,
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
 )
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from vllm_ascend.core.qwen4_exp_kv_cache_layout import (
-    GDN,
-    PLE,
-    QSA_RAW,
-    TENSOR1,
-    TENSOR2,
-    TENSOR3,
-    TENSOR4,
-    build_qwen4_exp_kv_cache_layout,
-    make_contiguous_plane_view,
+    CIRCULAR_STATE,
+    COMPRESSED_KEY,
+    CONV_STATE,
+    KEY_OR_SSM,
+    VALUE_OR_PLE,
+    Qwen4ExpKVCachePlanner,
+    make_plane_view,
 )
 from vllm_ascend.patch.platform.patch_kv_cache_utils import (
     _get_qwen4_exp_kv_cache_config,
-    _merge_ple_into_last_gdn_group,
-    _merge_qsa_composite_groups,
-    _merge_shattered_gdn_groups,
-    _order_qwen4_exp_cache_groups,
-    _prepare_qsa_composite_groups,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
@@ -86,225 +80,150 @@ def _specs(*, include_mtp: bool = False) -> dict[str, KVCacheSpec]:
     return specs
 
 
-def _five_groups(*, include_mtp: bool = False) -> list[KVCacheGroupSpec]:
-    specs = _specs(include_mtp=include_mtp)
-    groups = [KVCacheGroupSpec([name], spec, is_eagle_group=".mtp." in name) for name, spec in specs.items()]
-    groups = _merge_shattered_gdn_groups(specs, groups)
-    owners = _prepare_qsa_composite_groups(specs)
-    assert owners is not None
-    groups = _merge_qsa_composite_groups(groups, specs, *owners)
-    groups = _merge_ple_into_last_gdn_group(groups, specs)
-    return _order_qwen4_exp_cache_groups(groups, specs)
+def _groups(*, include_mtp: bool = False):
+    return Qwen4ExpKVCachePlanner().get_kv_cache_groups(_specs(include_mtp=include_mtp))
 
 
-def test_qwen4_exp_group_ids_are_qsa_three_gdn_and_ring() -> None:
-    groups = _five_groups()
-    assert len(groups) == 5
-
+def test_standard_topology_has_six_semantic_groups() -> None:
+    groups = _groups()
+    assert len(groups) == 6
     assert sum(name.endswith(".attn") for name in groups[0].layer_names) == 12
-    assert sum(name.endswith(".indexer.compressed_key_cache") for name in groups[0].layer_names) == 12
-    assert all(len(groups[index].layer_names) == 12 for index in (1, 2))
-    assert len(groups[3].layer_names) == 13
-    assert groups[3].layer_names[-1] == "model.ple"
-    assert len(groups[4].layer_names) == 12
-    assert all(name.endswith(".indexer.raw_key_cache") for name in groups[4].layer_names)
-
-    for ordinal, group_id in enumerate((1, 2, 3)):
-        expected = [f"model.layers.{index}.linear_attn" for index in range(ordinal, 36, 3)]
-        assert groups[group_id].layer_names[:12] == expected
+    assert sum(name.endswith(".compressed_key_cache") for name in groups[0].layer_names) == 12
+    assert [len(group.layer_names) for group in groups[1:4]] == [12, 12, 12]
+    assert groups[4].layer_names == ["model.ple"]
+    assert all(name.endswith(".raw_key_cache") for name in groups[5].layer_names)
+    assert groups[5].enable_kv_transfer is False
 
 
-def test_qwen4_exp_layout_has_four_planes_and_independent_ring() -> None:
-    layout = build_qwen4_exp_kv_cache_layout(_five_groups(), num_blocks=3)
-    assert layout is not None
-    assert layout.slot_count == 12
-    assert layout.ring_slot_count == 12
-    assert [plane.name for plane in layout.planes] == [
-        TENSOR1,
-        TENSOR2,
-        TENSOR3,
-        TENSOR4,
+def test_gdn_topology_lanes_are_derived_not_fixed() -> None:
+    specs = _specs()
+    for name in list(specs):
+        if name.endswith(".linear_attn") and int(name.split(".layers.")[1].split(".")[0]) % 3 == 2:
+            del specs[name]
+    groups = Qwen4ExpKVCachePlanner().get_kv_cache_groups(specs)
+    assert len(groups) == 5
+    assert [len(group.layer_names) for group in groups[1:3]] == [12, 12]
+
+
+@pytest.mark.parametrize("layout", [KVCacheLayout.BLNHC, KVCacheLayout.LBNHC])
+def test_plane_geometry_follows_resolved_layout(layout: KVCacheLayout) -> None:
+    plan = Qwen4ExpKVCachePlanner().build_physical_plan(_groups(), num_blocks=3, layout=layout)
+    assert plan is not None
+    assert [plane.name for plane in plan.planes] == [
+        VALUE_OR_PLE,
+        KEY_OR_SSM,
+        CONV_STATE,
+        COMPRESSED_KEY,
+        CIRCULAR_STATE,
     ]
-    assert [plane.page_size_bytes for plane in layout.planes] == [
+    assert [plane.page_size_bytes for plane in plan.planes] == [
         128 * 256 * 2,
         128 * 256 * 2,
         1280 * 2,
-        32 * 128 * 2,
+        128 * 128 * 2,
+        8 * 130 * 2,
     ]
-    assert layout.plane(TENSOR1).page_size_bytes // 2 - 10240 == 22528
-    assert layout.plane(TENSOR2).page_size_bytes - (128 * 128 * 2) == 128 * 128 * 2
-    assert layout.ring_page_size_bytes == 8 * 130 * 2
-    assert layout.ring_backing_size == (layout.ring_slot_count * layout.ring_slot_backing_size)
-
-    ple = layout.owner("model.ple")
-    assert ple.role == PLE
-    assert ple.group_id == 3
-    assert ple.slot == 0
-    gdn_groups = {owner.group_id for owner in layout.owners if owner.role == GDN}
-    assert gdn_groups == {1, 2, 3}
-    assert {owner.group_id for owner in layout.owners if owner.role == QSA_RAW} == {4}
+    assert plan.slot_count == 12
+    assert plan.plane(VALUE_OR_PLE).page_size_bytes // 2 - 10240 == 22528
+    assert plan.plane(KEY_OR_SSM).page_size_bytes // 2 - 128 * 128 == 128 * 128
+    for plane in plan.planes:
+        if layout.is_block_outermost:
+            assert plane.layer_stride == plane.page_size_bytes
+            assert plane.block_stride == plane.slot_count * plane.page_size_bytes
+        else:
+            assert plane.layer_stride == 3 * plane.page_size_bytes
+            assert plane.block_stride == plane.page_size_bytes
 
 
-def test_mtp_adds_one_qsa_and_ring_slot_and_propagates_eagle() -> None:
-    groups = _five_groups(include_mtp=True)
-    assert len(groups) == 5
+def test_blnhc_view_uses_block_outermost_stride() -> None:
+    plan = Qwen4ExpKVCachePlanner().build_physical_plan(_groups(), num_blocks=3, layout=KVCacheLayout.BLNHC)
+    assert plan is not None
+    owner = plan.owner("model.layers.3.self_attn.attn")
+    recipe = next(v for v in plan.owner_views(owner.layer_name) if v.component == "k")
+    plane = plan.plane(recipe.plane_name)
+    backing = torch.zeros(plane.size, dtype=torch.int8)
+    view = make_plane_view(
+        backing,
+        plane=plane,
+        slot=recipe.slot,
+        dtype=recipe.dtype,
+        item_shape=recipe.item_shape,
+    )
+    assert view.shape == (3, 128, 1, 256)
+    assert view.stride(0) == plane.block_stride // 2
+    assert not view.is_contiguous()
+
+
+def test_mtp_extends_qsa_and_ring_without_changing_gdn_lanes() -> None:
+    groups = _groups(include_mtp=True)
+    assert len(groups) == 6
     assert groups[0].is_eagle_group
-    assert groups[4].is_eagle_group
-    layout = build_qwen4_exp_kv_cache_layout(groups, num_blocks=2)
-    assert layout is not None
-    assert layout.slot_count == 13
-    assert layout.ring_slot_count == 13
-    assert layout.owner("model.mtp.layers.48.self_attn.attn").slot == 12
-    assert layout.owner("model.mtp.layers.48.self_attn.indexer.raw_key_cache").group_id == 4
+    assert groups[5].is_eagle_group
+    plan = Qwen4ExpKVCachePlanner().build_physical_plan(groups, num_blocks=2, layout=KVCacheLayout.LBNHC)
+    assert plan is not None
+    assert plan.slot_count == 13
+    assert plan.ring_slot_count == 13
+    assert plan.owner("model.mtp.layers.48.self_attn.indexer.raw_key_cache").group_id == 5
 
 
-def test_packed_views_are_bounded_and_ring_storage_is_independent() -> None:
-    layout = build_qwen4_exp_kv_cache_layout(_five_groups(), num_blocks=3)
-    assert layout is not None
-    planes = {
-        plane.name: torch.zeros(layout.plane_backing_size(plane.name), dtype=torch.int8) for plane in layout.planes
-    }
-    ring = torch.zeros(layout.ring_backing_size, dtype=torch.int8)
-    pointers = {backing.untyped_storage().data_ptr() for backing in planes.values()}
-    assert len(pointers) == 4
-    assert ring.untyped_storage().data_ptr() not in pointers
-
-    qsa_source = "model.layers.3.self_attn"
-    qsa_owner = layout.owner(f"{qsa_source}.attn")
-    k_cache = make_contiguous_plane_view(
-        planes[TENSOR2],
-        dtype=torch.bfloat16,
-        num_blocks=3,
-        item_shape=(128, 1, 256),
-        storage_offset=qsa_owner.slot * layout.plane(TENSOR2).size,
+def test_config_uses_resolved_blnhc_descriptor_geometry() -> None:
+    cache_config = SimpleNamespace(
+        num_gpu_blocks_override=3,
+        prefix_cache_retention_interval=None,
+        get_resolved_kv_cache_layout=lambda: KVCacheLayout.BLNHC,
     )
-    v_cache = make_contiguous_plane_view(
-        planes[TENSOR1],
-        dtype=torch.bfloat16,
-        num_blocks=3,
-        item_shape=(128, 1, 256),
-        storage_offset=qsa_owner.slot * layout.plane(TENSOR1).size,
-    )
-    raw_owner = layout.owner(f"{qsa_source}.indexer.raw_key_cache")
-    raw_cache = make_contiguous_plane_view(
-        ring,
-        dtype=torch.bfloat16,
-        num_blocks=3,
-        item_shape=(1, 8, 130),
-        storage_offset=raw_owner.slot * layout.ring_slot_backing_size,
-    )
-    assert k_cache.shape == (3, 128, 1, 256)
-    assert v_cache.shape == (3, 128, 1, 256)
-    assert raw_cache.shape == (3, 1, 8, 130)
-    assert k_cache.is_contiguous() and v_cache.is_contiguous()
-    assert raw_cache.is_contiguous()
-    assert raw_cache.untyped_storage().data_ptr() == ring.untyped_storage().data_ptr()
-    assert raw_cache.untyped_storage().data_ptr() not in pointers
-
-
-def test_planner_describes_normal_and_ring_backings_separately() -> None:
-    config = _get_qwen4_exp_kv_cache_config(
-        SimpleNamespace(
-            cache_config=SimpleNamespace(
-                num_gpu_blocks_override=3,
-                prefix_cache_retention_interval=None,
-            )
-        ),
-        _five_groups(),
-        10**9,
-    )
+    config = _get_qwen4_exp_kv_cache_config(SimpleNamespace(cache_config=cache_config), _groups(), 10**9)
     assert config is not None
     assert config.num_blocks == 3
-    assert len(config.kv_cache_groups) == 5
-    layout = build_qwen4_exp_kv_cache_layout(config.kv_cache_groups, 3)
-    assert layout is not None
-    normal = config.kv_cache_tensors[:6]
-    ring = config.kv_cache_tensors[6]
-    assert [tensor.size for tensor in normal] == [
-        layout.plane_backing_size(name)
-        for name in (
-            TENSOR2,
-            TENSOR4,
-            TENSOR3,
-            TENSOR3,
-            TENSOR3,
-            TENSOR1,
-        )
-    ]
-    assert ring.size == layout.ring_backing_size
-    assert ring.layers == config.kv_cache_groups[4].layer_names
+    assert config.kv_cache_layout == "BLNHC"
+    plan = Qwen4ExpKVCachePlanner().build_physical_plan(config.kv_cache_groups, 3, KVCacheLayout.BLNHC)
+    assert plan is not None
+    assert config.kv_cache_tensors[0].block_stride == plan.plane(KEY_OR_SSM).block_stride
 
 
-def test_runner_allocates_independent_ring_and_materializes_views() -> None:
-    config = _get_qwen4_exp_kv_cache_config(
-        SimpleNamespace(
-            cache_config=SimpleNamespace(
-                num_gpu_blocks_override=3,
-                prefix_cache_retention_interval=None,
-            )
-        ),
-        _five_groups(),
-        10**9,
+def test_runner_allocates_each_plane_once_and_materializes_recipes() -> None:
+    cache_config = SimpleNamespace(
+        num_gpu_blocks_override=3,
+        prefix_cache_retention_interval=None,
+        get_resolved_kv_cache_layout=lambda: KVCacheLayout.LBNHC,
     )
+    vllm_config = SimpleNamespace(
+        cache_config=cache_config,
+        kv_transfer_config=None,
+    )
+    config = _get_qwen4_exp_kv_cache_config(vllm_config, _groups(), 10**9)
     assert config is not None
     runner = NPUModelRunner.__new__(NPUModelRunner)
     runner.device = torch.device("cpu")
     runner.ascend_config = SimpleNamespace(kvpp_config=SimpleNamespace(size=1))
-    runner.vllm_config = SimpleNamespace(
-        kv_transfer_config=None,
-        cache_config=SimpleNamespace(),
-    )
+    runner.vllm_config = vllm_config
     runner.use_sparse = False
     runner.use_compress = False
     runner.use_hybrid_blocks = False
     runner.runner_only_attn_layers = set()
     runner.sparse_kv_offload_enabled = False
     runner._kv_cache_spec_attn_group_iterator = lambda: [
-        SimpleNamespace(
-            backend=SimpleNamespace(),
-            kv_cache_spec=group.kv_cache_spec,
-            layer_names=group.layer_names,
-        )
-        for group in config.kv_cache_groups
+        SimpleNamespace(backend=SimpleNamespace(), kv_cache_spec=g.kv_cache_spec, layer_names=g.layer_names)
+        for g in config.kv_cache_groups
     ]
-
     raw = runner._allocate_kv_cache_tensors(config)
     caches = runner._reshape_kv_cache_tensors(config, raw)
     source = "model.layers.3.self_attn"
-    normal = raw[f"{source}.attn"]
-    ring = raw[f"{source}.indexer.raw_key_cache"]
-    assert isinstance(normal, tuple)
-    assert isinstance(ring, torch.Tensor)
-    normal_pointers = {backing.untyped_storage().data_ptr() for backing in normal}
-    assert len(normal_pointers) == 2
-    assert ring.untyped_storage().data_ptr() not in normal_pointers
+    qsa = raw[f"{source}.attn"]
     gdn = raw["model.layers.0.linear_attn"]
-    ple = raw["model.ple"]
-    compressed = raw[f"{source}.indexer.compressed_key_cache"]
-    assert isinstance(gdn, tuple)
-    assert isinstance(ple, torch.Tensor)
-    assert isinstance(compressed, torch.Tensor)
-    assert gdn[1].untyped_storage().data_ptr() == normal[0].untyped_storage().data_ptr()
-    assert ple.untyped_storage().data_ptr() == normal[1].untyped_storage().data_ptr()
-    four_plane_pointers = {
-        normal[0].untyped_storage().data_ptr(),
-        normal[1].untyped_storage().data_ptr(),
-        gdn[0].untyped_storage().data_ptr(),
-        compressed.untyped_storage().data_ptr(),
+    assert isinstance(qsa, tuple) and isinstance(gdn, tuple)
+    pointers = {
+        tensor.untyped_storage().data_ptr()
+        for value in raw.values()
+        for tensor in (value if isinstance(value, tuple) else (value,))
     }
-    assert len(four_plane_pointers) == 4
+    assert len(pointers) == 5
     assert caches[f"{source}.attn"][0].shape == (3, 128, 1, 256)
-    assert caches[f"{source}.attn"][1].shape == (3, 128, 1, 256)
-    assert caches[f"{source}.indexer.raw_key_cache"].shape == (3, 1, 8, 130)
     assert caches["model.ple"][0].shape == (3, 10240)
 
 
-def test_qsa_source_sets_must_match() -> None:
-    groups = _five_groups()
-    groups[4].layer_names[-1] = "model.layers.46.self_attn.indexer.raw_key_cache"
-    try:
-        build_qwen4_exp_kv_cache_layout(groups, num_blocks=2)
-    except (KeyError, ValueError) as error:
-        assert "raw" in str(error).lower() or "source-layer mapping" in str(error)
-    else:
-        raise AssertionError("mismatched QSA owners were accepted")
+def test_mismatched_qsa_sources_fail_fast() -> None:
+    specs = _specs()
+    del specs["model.layers.47.self_attn.indexer.raw_key_cache"]
+    with pytest.raises(ValueError, match="one-to-one"):
+        Qwen4ExpKVCachePlanner().get_kv_cache_groups(specs)
