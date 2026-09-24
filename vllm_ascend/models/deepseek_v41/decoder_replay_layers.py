@@ -9,7 +9,6 @@ import torch
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import get_tp_group, tensor_model_parallel_all_gather
 from vllm.logger import logger
-from vllm.models.deepseek_v41.decoder_replay_layers import DecoderReplayLayers
 
 from vllm_ascend.utils import enable_dsa_cp
 
@@ -17,10 +16,22 @@ if TYPE_CHECKING:
     from .model import DeepseekV41Model
 
 
-class AscendDecoderReplayLayers(DecoderReplayLayers):
-    context_factory: Callable[[], AbstractContextManager[None]] | None = None
-    num_actual_rows: int = 0
-    sequence_parallel: bool = False
+class AscendDecoderReplayLayers:
+    """Gather and scatter the MRV2 decoder sub-batch, including sharded states."""
+
+    def __init__(
+        self,
+        window: int,
+        run_layers: Callable[..., tuple[torch.Tensor, ...]],
+        row_buffers: list[torch.Tensor],
+    ) -> None:
+        self.window = window
+        self.run_layers = run_layers
+        self.row_buffers = row_buffers
+        self.rows: torch.Tensor | None = None
+        self.context_factory: Callable[[], AbstractContextManager[None]] | None = None
+        self.num_actual_rows = 0
+        self.sequence_parallel = False
 
     def __call__(self, *states: torch.Tensor | None) -> tuple[torch.Tensor, ...]:
         if self.rows is None:
@@ -42,7 +53,7 @@ class AscendDecoderReplayLayers(DecoderReplayLayers):
                     buffer[:replay_tokens].copy_(global_buffer.index_select(0, local_rows))
                 else:
                     buffer[: rows.numel()].copy_(buffer.index_select(0, rows))
-            replay_states = []
+            replay_states: list[torch.Tensor | None] = []
             for index, state in enumerate(states):
                 if state is None:
                     replay_states.append(None)
@@ -72,7 +83,7 @@ class AscendDecoderReplayLayers(DecoderReplayLayers):
 
 
 def make_decoder_replay(model: "DeepseekV41Model", config: VllmConfig) -> AscendDecoderReplayLayers | None:
-    if not config.cache_config.swa_bounded_replay:
+    if not getattr(config.cache_config, "swa_bounded_replay", False):
         return None
     parallel = config.parallel_config
     speculative = config.speculative_config
@@ -98,7 +109,7 @@ def make_decoder_replay(model: "DeepseekV41Model", config: VllmConfig) -> Ascend
     elif any(layer > cut for layer in model.config.engram_layer_ids):
         reason = "an Engram layer follows the last KV source"
     elif speculative is not None and not speculative.use_dspark():
-        reason = "the MRV1 replay adapter currently supports DSpark drafting only"
+        reason = "the replay adapter currently supports DSpark drafting only"
     elif draft_config is not None and (
         draft_window is None
         or draft_window > model.config.sliding_window
@@ -113,7 +124,7 @@ def make_decoder_replay(model: "DeepseekV41Model", config: VllmConfig) -> Ascend
     else:
         model.decoder_replay_start = cut + 1
         logger.info_once(
-            "Ascend decoder bounded replay: layers %d-%d keep each prefill's last %d tokens.",
+            "Ascend MRV2 decoder bounded replay: layers %d-%d keep each prefill's last %d tokens.",
             cut + 1,
             model.end_layer - 1,
             model.config.sliding_window,
