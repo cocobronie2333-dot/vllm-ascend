@@ -10,7 +10,6 @@ from vllm.logger import logger
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.core.kv_cache_utils import _approximate_gcd, may_override_num_blocks
 from vllm.v1.kv_cache_interface import (
-    CircularBufferSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -24,17 +23,10 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_kind,
 )
 
-from vllm_ascend.core.kv_cache_interface import (
-    get_kv_cache_compression_ratio,
-    is_prefix_cacheable,
-)
+from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
 from vllm_ascend.core.qwen4_exp_kv_cache_layout import (
-    GDN,
+    CIRCULAR_STATE,
     HIDDEN,
-    PLE,
-    QSA_COMPRESSED,
-    QSA_MAIN,
-    QSA_RAW,
     Qwen4ExpKVCachePlanner,
     build_qwen4_exp_kv_cache_layout,
 )
@@ -693,305 +685,6 @@ def _ascend_max_memory_usage_bytes_from_groups(
     )
 
 
-def _prepare_qsa_composite_groups(
-    kv_cache_spec: dict[str, KVCacheSpec],
-) -> tuple[set[str], set[str], set[str]] | None:
-    """Identify the three cache owners of every QSA source layer.
-
-    The packed backing aliases main K/V and compressed-key pages by the same
-    physical block ID, while the raw-key ring has one request-lifetime block
-    in an independent allocation. Grouping must therefore express those
-    lifetimes before the block manager and admission planner see the specs.
-    """
-
-    raw = {
-        name[: -len(".indexer.raw_key_cache")]: (name, spec)
-        for name, spec in kv_cache_spec.items()
-        if name.endswith(".indexer.raw_key_cache") and isinstance(spec, CircularBufferSpec)
-    }
-    if not raw:
-        return None
-    all_main = {
-        name[: -len(".attn")]: (name, spec)
-        for name, spec in kv_cache_spec.items()
-        if name.endswith(".attn") and isinstance(spec, FullAttentionSpec) and not isinstance(spec, MLAAttentionSpec)
-    }
-    all_compressed = {
-        name[: -len(".indexer.compressed_key_cache")]: (name, spec)
-        for name, spec in kv_cache_spec.items()
-        if name.endswith(".indexer.compressed_key_cache")
-        and isinstance(spec, MLAAttentionSpec)
-        and get_kv_cache_compression_ratio(spec) > 1
-    }
-    missing_main = set(raw) - set(all_main)
-    missing_compressed = set(raw) - set(all_compressed)
-    if missing_main or missing_compressed:
-        raise ValueError(
-            "QSA raw cache owners must have matching main/compressed owners: "
-            f"missing_main={sorted(missing_main)}, "
-            f"missing_compressed={sorted(missing_compressed)}"
-        )
-    main = {source: all_main[source] for source in raw}
-    compressed = {source: all_compressed[source] for source in raw}
-    if not any(isinstance(spec, MambaSpec) and len(spec.shapes) == 2 for spec in kv_cache_spec.values()):
-        raise ValueError("Qwen4Exp packed cache layout requires GDN state specs")
-
-    main_names: set[str] = set()
-    compressed_names: set[str] = set()
-    raw_names: set[str] = set()
-    for source in sorted(main):
-        main_name, main_spec = main[source]
-        compressed_name, compressed_spec = compressed[source]
-        raw_name, raw_spec = raw[source]
-        assert isinstance(main_spec, FullAttentionSpec)
-        assert isinstance(compressed_spec, MLAAttentionSpec)
-        assert isinstance(raw_spec, CircularBufferSpec)
-        ratio = get_kv_cache_compression_ratio(compressed_spec)
-        if main_spec.block_size != compressed_spec.block_size:
-            raise ValueError(
-                f"{main_name} block_size={main_spec.block_size} does not match "
-                f"{compressed_name} block_size={compressed_spec.block_size}"
-            )
-        if main_spec.block_size % 128 or main_spec.block_size % ratio:
-            raise ValueError(
-                f"QSA block_size={main_spec.block_size} violates kernel/compression alignment (ratio={ratio})"
-            )
-        if raw_spec.block_size % ratio:
-            raise ValueError(
-                f"{raw_name} capacity={raw_spec.block_size} is not compression-ratio aligned (ratio={ratio})"
-            )
-        main_names.add(main_name)
-        compressed_names.add(compressed_name)
-        raw_names.add(raw_name)
-    return main_names, compressed_names, raw_names
-
-
-def _merge_qsa_composite_groups(
-    groups: list[KVCacheGroupSpec],
-    kv_cache_spec: dict[str, KVCacheSpec],
-    main_names: set[str],
-    compressed_names: set[str],
-    raw_names: set[str],
-) -> list[KVCacheGroupSpec]:
-    """Give QSA aliases the block-table lifetimes their backing requires."""
-
-    def merge_owners(
-        current: list[KVCacheGroupSpec],
-        owner_names: set[str],
-        description: str,
-        ordered_names: list[str] | None = None,
-    ) -> list[KVCacheGroupSpec]:
-        consumed: list[int] = []
-        eagle = False
-        for index, group in enumerate(current):
-            members = set(group.layer_names)
-            if not members & owner_names:
-                continue
-            if not members <= owner_names:
-                raise ValueError(f"QSA {description} owners were mixed with another cache role")
-            consumed.append(index)
-            eagle = eagle or group.is_eagle_group
-        if not consumed:
-            raise ValueError(f"QSA {description} owners were not grouped")
-        covered = set().union(*(set(current[index].layer_names) for index in consumed))
-        if covered != owner_names:
-            raise ValueError(f"QSA {description} grouping lost cache owners")
-        ordered = ordered_names or [name for name in kv_cache_spec if name in owner_names]
-        if set(ordered) != owner_names or len(ordered) != len(owner_names):
-            raise ValueError(f"QSA {description} owner order does not match its cache owners")
-        uniform = UniformTypeKVCacheSpecs.from_specs({name: kv_cache_spec[name] for name in ordered})
-        if uniform is None:
-            raise ValueError(f"QSA {description} owners do not have one lifetime")
-        merged = KVCacheGroupSpec(
-            ordered,
-            uniform,
-            is_eagle_group=eagle,
-        )
-        first = min(consumed)
-        return [
-            merged if index == first else group
-            for index, group in enumerate(current)
-            if index == first or index not in consumed
-        ]
-
-    result = merge_owners(
-        groups,
-        main_names | compressed_names,
-        "main/compressed",
-        [name for name in kv_cache_spec if name in main_names]
-        + [name for name in kv_cache_spec if name in compressed_names],
-    )
-    return merge_owners(result, raw_names, "raw circular")
-
-
-def _merge_shattered_gdn_groups(
-    kv_cache_spec: dict[str, KVCacheSpec],
-    groups: list[KVCacheGroupSpec],
-) -> list[KVCacheGroupSpec]:
-    """Restore the three 12-layer GDN groups split by the singleton PLE.
-
-    Upstream derives its group size from the rarest spec bucket.  Qwen3.8
-    Flash-Next has one PLE owner next to 36 identical GDN owners, so the
-    generic grouping path produces 36 singleton GDN groups.  Rebuild only a
-    fully shattered, identical GDN bucket and retain upstream's strided layer
-    ordering.
-    """
-    same_type_layers: dict[KVCacheSpec, list[str]] = defaultdict(list)
-    for layer_name, layer_spec in kv_cache_spec.items():
-        same_type_layers[layer_spec].append(layer_name)
-
-    def is_gdn_singleton(group: KVCacheGroupSpec) -> bool:
-        return (
-            len(group.layer_names) == 1
-            and isinstance(group.kv_cache_spec, MambaSpec)
-            and len(group.kv_cache_spec.shapes) == 2
-        )
-
-    gdn_buckets = [
-        (spec, layers)
-        for spec, layers in same_type_layers.items()
-        if isinstance(spec, MambaSpec) and len(spec.shapes) == 2 and len(layers) > 1
-    ]
-    if not gdn_buckets:
-        return groups
-
-    multi_sizes = [len(layers) for layers in same_type_layers.values() if len(layers) > 1]
-    group_size = min(multi_sizes)
-    max_size = max(multi_sizes)
-    if max_size < group_size * 1.5:
-        group_size = max_size
-
-    regrouped: list[KVCacheGroupSpec] = []
-    consumed: set[str] = set()
-    for spec, layers in gdn_buckets:
-        member_set = set(layers)
-        singleton_groups = [group for group in groups if is_gdn_singleton(group) and group.layer_names[0] in member_set]
-        if len(singleton_groups) != len(layers):
-            continue
-        num_groups = math.ceil(len(layers) / group_size)
-        eagle = any(group.is_eagle_group for group in singleton_groups)
-        for index in range(num_groups):
-            chunk = layers[index::num_groups]
-            regrouped.append(
-                KVCacheGroupSpec(
-                    chunk,
-                    spec.merge([kv_cache_spec[name] for name in chunk]),
-                    is_eagle_group=eagle,
-                )
-            )
-        consumed |= member_set
-
-    if not consumed:
-        return groups
-
-    result: list[KVCacheGroupSpec] = []
-    inserted = False
-    for group in groups:
-        if is_gdn_singleton(group) and group.layer_names[0] in consumed:
-            if not inserted:
-                result.extend(regrouped)
-                inserted = True
-            continue
-        result.append(group)
-    return result
-
-
-def _merge_ple_into_last_gdn_group(
-    groups: list[KVCacheGroupSpec],
-    kv_cache_spec: dict[str, KVCacheSpec],
-) -> list[KVCacheGroupSpec]:
-    """Share the third GDN block table with the singleton PLE owner.
-
-    The physical layout keeps GDN and PLE in disjoint tensor planes.  The
-    wrapper is intentionally anchored by the GDN spec so the coordinator uses
-    ``MambaManager`` for their common align-mode lifetime.
-    """
-    gdn_indices = [
-        index
-        for index, group in enumerate(groups)
-        if all(
-            isinstance(kv_cache_spec[name], MambaSpec) and len(kv_cache_spec[name].shapes) == 2
-            for name in group.layer_names
-        )
-    ]
-    ple_indices = [
-        index
-        for index, group in enumerate(groups)
-        if len(group.layer_names) == 1
-        and isinstance(kv_cache_spec[group.layer_names[0]], MambaSpec)
-        and len(kv_cache_spec[group.layer_names[0]].shapes) == 1
-    ]
-    if len(gdn_indices) != 3 or len(ple_indices) != 1:
-        raise ValueError(
-            "Qwen3.8 packed cache requires three GDN groups and one PLE group; "
-            f"got gdn={len(gdn_indices)}, ple={len(ple_indices)}"
-        )
-
-    def first_layer_id(index: int) -> int:
-        return min(int(name.split(".layers.", 1)[1].split(".", 1)[0]) for name in groups[index].layer_names)
-
-    gdn_indices.sort(key=first_layer_id)
-    target_index = gdn_indices[-1]
-    ple_index = ple_indices[0]
-    target = groups[target_index]
-    ple = groups[ple_index]
-    ordered_names = [*target.layer_names, *ple.layer_names]
-    nested_specs = {name: kv_cache_spec[name] for name in ordered_names}
-    merged = KVCacheGroupSpec(
-        ordered_names,
-        UniformTypeKVCacheSpecs(
-            block_size=target.kv_cache_spec.block_size,
-            kv_cache_specs=nested_specs,
-        ),
-        is_eagle_group=target.is_eagle_group or ple.is_eagle_group,
-    )
-    return [merged if index == target_index else group for index, group in enumerate(groups) if index != ple_index]
-
-
-def _order_qwen4_exp_cache_groups(
-    groups: list[KVCacheGroupSpec],
-    kv_cache_spec: dict[str, KVCacheSpec],
-) -> list[KVCacheGroupSpec]:
-    """Assign stable group IDs: QSA, GDN x3, independent RingBuffer."""
-
-    def roles(group: KVCacheGroupSpec) -> set[str]:
-        result: set[str] = set()
-        for name in group.layer_names:
-            spec = kv_cache_spec[name]
-            if name.endswith(".raw_key_cache"):
-                result.add(QSA_RAW)
-            elif name.endswith(".compressed_key_cache"):
-                result.add(QSA_COMPRESSED)
-            elif name.endswith(".attn"):
-                result.add(QSA_MAIN)
-            elif isinstance(spec, MambaSpec) and len(spec.shapes) == 2:
-                result.add(GDN)
-            elif isinstance(spec, MambaSpec) and len(spec.shapes) == 1:
-                result.add(PLE)
-            else:
-                result.add(HIDDEN)
-        return result
-
-    qsa = [group for group in groups if roles(group) & {QSA_MAIN, QSA_COMPRESSED}]
-    gdn = [group for group in groups if GDN in roles(group)]
-    gdn.sort(
-        key=lambda group: min(
-            int(name.split(".layers.", 1)[1].split(".", 1)[0])
-            for name in group.layer_names
-            if isinstance(kv_cache_spec[name], MambaSpec) and len(kv_cache_spec[name].shapes) == 2
-        )
-    )
-    ring = [group for group in groups if roles(group) == {QSA_RAW}]
-    consumed = {id(group) for group in [*qsa, *gdn, *ring]}
-    other = [group for group in groups if id(group) not in consumed]
-    if len(qsa) != 1 or len(gdn) != 3 or len(ring) != 1:
-        raise ValueError(
-            "Qwen3.8 cache group order requires QSA + 3 GDN + RingBuffer; "
-            f"got qsa={len(qsa)}, gdn={len(gdn)}, ring={len(ring)}"
-        )
-    return [*qsa, *gdn, *ring, *other]
-
-
 def _get_ascend_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -1032,7 +725,11 @@ def _get_qwen4_exp_kv_cache_config(
 
     hidden_owners = [owner for owner in probe.owners if owner.role == HIDDEN]
     hidden_bytes_per_block = sum(owner.spec.page_size_bytes for owner in hidden_owners)
-    normal_bytes_per_block = sum(plane.page_size_bytes for plane in probe.planes) * probe.slot_count
+    normal_bytes_per_block = sum(
+        plane.page_size_bytes * plane.slot_count
+        for plane in probe.planes
+        if plane.name != CIRCULAR_STATE
+    )
     ring_bytes_per_block = probe.ring_page_size_bytes * probe.ring_slot_count
     bytes_per_block = normal_bytes_per_block + ring_bytes_per_block + hidden_bytes_per_block
     candidate = available_memory // bytes_per_block

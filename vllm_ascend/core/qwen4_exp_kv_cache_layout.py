@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Final
+from typing import Final, Literal, TypeAlias
 
 import regex as re
 import torch
@@ -37,14 +38,43 @@ CONV_STATE: Final = "conv_state"
 COMPRESSED_KEY: Final = "compressed_key"
 CIRCULAR_STATE: Final = "circular_state"
 
+_LINEAR_ATTENTION: Final = "linear_attention"
+_QSA_LAYER_TYPES: Final = frozenset(("full_attention", "qwen_sparse_attention"))
+
+CacheRole: TypeAlias = Literal[
+    "qsa_main", "qsa_raw", "qsa_compressed", "gdn", "ple", "hidden"
+]
+CacheOwnerSpec: TypeAlias = (
+    FullAttentionSpec
+    | MLAAttentionSpec
+    | CircularBufferSpec
+    | MambaSpec
+    | HiddenStateCacheSpec
+)
+ViewContainer: TypeAlias = Literal["tensor", "tuple", "list", "none"]
+
 
 @dataclass(frozen=True)
 class CacheOwner:
     layer_name: str
-    spec: KVCacheSpec
-    role: str
+    spec: CacheOwnerSpec
+    role: CacheRole
     slot: int
     group_id: int
+    view_container: ViewContainer
+
+    def materialize(
+        self, components: Sequence[torch.Tensor]
+    ) -> torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor]:
+        if self.view_container == "tensor":
+            if len(components) != 1:
+                raise ValueError(f"{self.layer_name} requires exactly one cache component")
+            return components[0]
+        if self.view_container == "tuple":
+            return tuple(components)
+        if self.view_container == "list":
+            return list(components)
+        raise ValueError(f"{self.layer_name} has no materializable cache components")
 
 
 @dataclass(frozen=True)
@@ -165,6 +195,19 @@ def _sort_key(name: str) -> tuple[int, str]:
     return (int(match[-1]), name) if match else (2**31 - 1, name)
 
 
+def _layer_index(name: str) -> int | None:
+    index, _ = _sort_key(name)
+    return None if index == 2**31 - 1 else index
+
+
+def _minimal_period(sequence: Sequence[str]) -> int:
+    """Return the shortest motif whose repetitions plus a prefix form sequence."""
+    for period in range(1, len(sequence) + 1):
+        if all(value == sequence[index % period] for index, value in enumerate(sequence)):
+            return period
+    raise AssertionError("Every finite sequence has a period equal to its length")
+
+
 def _members(group: KVCacheGroupSpec) -> dict[str, KVCacheSpec]:
     spec = group.kv_cache_spec
     if isinstance(spec, UniformTypeKVCacheSpecs):
@@ -191,6 +234,91 @@ class Qwen4ExpKVCachePlanner:
 
     def __init__(self, vllm_config: VllmConfig | None = None):
         self.vllm_config = vllm_config
+
+    def _configured_layer_roles(self) -> list[str] | None:
+        if self.vllm_config is None:
+            return None
+        model_config = getattr(self.vllm_config, "model_config", None)
+        text_config = getattr(model_config, "hf_text_config", None)
+        layer_types = getattr(text_config, "layer_types", None)
+        if not layer_types:
+            return None
+        roles = []
+        for layer_type in layer_types:
+            if layer_type == _LINEAR_ATTENTION:
+                roles.append(GDN)
+            elif layer_type in _QSA_LAYER_TYPES:
+                roles.append(QSA_MAIN)
+            else:
+                raise ValueError(
+                    f"Unsupported Qwen4Exp layer type in model config: {layer_type}"
+                )
+        return roles
+
+    def _gdn_lanes(
+        self, gdn_names: list[str], qsa_sources: list[str]
+    ) -> list[list[str]]:
+        if not gdn_names:
+            return []
+
+        configured_roles = self._configured_layer_roles()
+        observed: dict[int, str] = {}
+        for name in gdn_names:
+            layer_id = _layer_index(name)
+            if layer_id is None:
+                raise ValueError(f"GDN cache owner has no layer index: {name}")
+            observed[layer_id] = GDN
+        for source in qsa_sources:
+            if ".mtp." in source:
+                continue
+            layer_id = _layer_index(source)
+            if layer_id is None:
+                raise ValueError(f"QSA cache owner has no layer index: {source}")
+            previous = observed.setdefault(layer_id, QSA_MAIN)
+            if previous != QSA_MAIN:
+                raise ValueError(f"Layer {layer_id} exposes both QSA and GDN cache owners")
+
+        if configured_roles is not None:
+            for layer_id, role in observed.items():
+                if layer_id >= len(configured_roles) or configured_roles[layer_id] != role:
+                    configured = configured_roles[layer_id] if layer_id < len(configured_roles) else None
+                    raise ValueError(
+                        f"Cache owner role disagrees with layer_types at layer {layer_id}: "
+                        f"owner={role}, configured={configured}"
+                    )
+            topology = configured_roles
+            topology_start = 0
+        else:
+            first, last = min(observed), max(observed)
+            missing = [layer_id for layer_id in range(first, last + 1) if layer_id not in observed]
+            if missing:
+                raise ValueError(
+                    "Cannot infer Qwen4Exp topology without layer_types; "
+                    f"cache-owner sequence is missing layers {missing}"
+                )
+            topology = [observed[layer_id] for layer_id in range(first, last + 1)]
+            topology_start = first
+
+        period = _minimal_period(topology)
+        gdn_slots = [slot for slot, role in enumerate(topology[:period]) if role == GDN]
+        names_by_layer: dict[int, str] = {}
+        for name in gdn_names:
+            layer_id = _layer_index(name)
+            assert layer_id is not None
+            names_by_layer[layer_id] = name
+        lanes = [
+            [
+                names_by_layer[layer_id]
+                for layer_id in sorted(names_by_layer)
+                if (layer_id - topology_start) % period == slot
+            ]
+            for slot in gdn_slots
+        ]
+        lanes = [lane for lane in lanes if lane]
+        assigned = {name for lane in lanes for name in lane}
+        if assigned != set(gdn_names):
+            raise ValueError(f"Topology grouping lost GDN owners: {sorted(set(gdn_names) - assigned)}")
+        return lanes
 
     @staticmethod
     def is_applicable(specs: dict[str, KVCacheSpec]) -> bool:
@@ -227,7 +355,13 @@ class Qwen4ExpKVCachePlanner:
         groups: list[KVCacheGroupSpec] = []
         combined = {n: specs[n] for n in [*main_names, *compressed_names]}
         if uniform := UniformTypeKVCacheSpecs.from_specs(combined):
-            groups.append(KVCacheGroupSpec(list(combined), uniform, is_eagle_group=any(".mtp." in n for n in combined)))
+            groups.append(
+                KVCacheGroupSpec(
+                    list(combined),
+                    uniform,
+                    is_eagle_group=any(".mtp." in n for n in combined),
+                )
+            )
         else:
             for role, names in ((QSA_MAIN, main_names), (QSA_COMPRESSED, compressed_names)):
                 subset = {n: specs[n] for n in names}
@@ -236,19 +370,13 @@ class Qwen4ExpKVCachePlanner:
                 )
 
         gdn_names = sorted((n for n, s in specs.items() if _classify(n, s) == GDN), key=_sort_key)
-        target_qsa = sum(".mtp." not in s for s in sources)
-        if not target_qsa or len(gdn_names) % target_qsa:
-            raise ValueError(f"Cannot derive GDN lanes: target_qsa={target_qsa}, gdn={len(gdn_names)}")
-        lane_count = len(gdn_names) // target_qsa
-        for lane in range(lane_count):
-            names = gdn_names[lane::lane_count]
+        for lane, names in enumerate(self._gdn_lanes(gdn_names, sources)):
             subset = {n: specs[n] for n in names}
             groups.append(KVCacheGroupSpec(names, _uniform(f"gdn_{lane}", subset)))
 
         ple_names = sorted((n for n, s in specs.items() if _classify(n, s) == PLE), key=_sort_key)
-        if not ple_names:
-            raise ValueError("Qwen4Exp requires a PLE cache owner")
-        groups.append(KVCacheGroupSpec(ple_names, _uniform(PLE, {n: specs[n] for n in ple_names})))
+        if ple_names:
+            groups.append(KVCacheGroupSpec(ple_names, _uniform(PLE, {n: specs[n] for n in ple_names})))
         groups.append(
             KVCacheGroupSpec(
                 raw_names,
@@ -291,7 +419,7 @@ class Qwen4ExpKVCachePlanner:
                 (by_role[role] if role else unknown).append((name, specs[name], group_id))
         if not by_role[QSA_RAW]:
             return None
-        missing = [r for r in (QSA_MAIN, QSA_RAW, QSA_COMPRESSED, GDN, PLE) if not by_role[r]]
+        missing = [r for r in (QSA_MAIN, QSA_RAW, QSA_COMPRESSED) if not by_role[r]]
         if missing or unknown:
             raise ValueError(f"Incomplete Qwen4Exp layout: missing={missing}, unknown={unknown}")
 
@@ -308,7 +436,7 @@ class Qwen4ExpKVCachePlanner:
         for entries in gdn_groups.values():
             entries.sort(key=lambda x: _sort_key(x[0]))
         ple = sorted(by_role[PLE], key=lambda x: _sort_key(x[0]))
-        slots = max(len(sources), len(ple), *(len(v) for v in gdn_groups.values()))
+        slots = max(len(sources), len(ple), *(len(v) for v in gdn_groups.values()), 1)
 
         mains = [s for _, s, _ in by_role[QSA_MAIN]]
         gdns = [s for _, s, _ in by_role[GDN]]
@@ -332,19 +460,20 @@ class Qwen4ExpKVCachePlanner:
                 for d in (s.dtypes if isinstance(s, MambaSpec) else (s.dtype,))
             ),
         )
-        pages = {
-            VALUE_OR_PLE: max(max(v for _, v in main_pages), max(_state_bytes(s, 0) for s in ples)),
-            KEY_OR_SSM: max(max(k for k, _ in main_pages), max(_state_bytes(s, 1) for s in gdns)),
-            CONV_STATE: max(_state_bytes(s, 0) for s in gdns),
-            COMPRESSED_KEY: max(
-                s.block_size * s.num_kv_heads * s.head_size * get_dtype_size(s.dtype)
+        requirements: dict[str, list[int]] = {
+            VALUE_OR_PLE: [v for _, v in main_pages] + [_state_bytes(s, 0) for s in ples],
+            KEY_OR_SSM: [k for k, _ in main_pages] + [_state_bytes(s, 1) for s in gdns],
+            CONV_STATE: [_state_bytes(s, 0) for s in gdns],
+            COMPRESSED_KEY: [
+                int(getattr(s, "real_page_size_bytes", s.page_size_bytes))
                 for _, s, _ in by_role[QSA_COMPRESSED]
                 if isinstance(s, MLAAttentionSpec)
-            ),
-            CIRCULAR_STATE: max(
+            ],
+            CIRCULAR_STATE: [
                 int(getattr(s, "real_page_size_bytes", s.page_size_bytes)) for _, s, _ in by_role[QSA_RAW]
-            ),
+            ],
         }
+        pages = {name: max(sizes) for name, sizes in requirements.items() if sizes}
         planes = tuple(
             TensorPlane(n, round_up(w, alignment), len(sources) if n == CIRCULAR_STATE else slots, num_blocks, layout)
             for n, w in pages.items()
@@ -354,7 +483,8 @@ class Qwen4ExpKVCachePlanner:
         for slot, source in enumerate(sources):
             for role in (QSA_MAIN, QSA_COMPRESSED, QSA_RAW):
                 n, s, g = qsa[role][source]
-                owners.append(CacheOwner(n, s, role, slot, g))
+                container: ViewContainer = "tuple" if role == QSA_MAIN else "tensor"
+                owners.append(CacheOwner(n, s, role, slot, g, container))
                 if role == QSA_MAIN:
                     assert isinstance(s, FullAttentionSpec)
                     views += [
@@ -386,16 +516,16 @@ class Qwen4ExpKVCachePlanner:
                     )
         for group_id, entries in sorted(gdn_groups.items()):
             for slot, (n, s) in enumerate(entries):
-                owners.append(CacheOwner(n, s, GDN, slot, group_id))
+                owners.append(CacheOwner(n, s, GDN, slot, group_id, "list"))
                 views += [
                     CacheComponentView(n, "conv", CONV_STATE, slot, s.dtypes[0], tuple(s.shapes[0])),
                     CacheComponentView(n, "ssm", KEY_OR_SSM, slot, s.dtypes[1], tuple(s.shapes[1])),
                 ]
         for slot, (n, s, g) in enumerate(ple):
             assert isinstance(s, MambaSpec)
-            owners.append(CacheOwner(n, s, PLE, slot, g))
+            owners.append(CacheOwner(n, s, PLE, slot, g, "list"))
             views.append(CacheComponentView(n, "ple", VALUE_OR_PLE, slot, s.dtypes[0], tuple(s.shapes[0])))
-        owners += [CacheOwner(n, s, HIDDEN, i, g) for i, (n, s, g) in enumerate(by_role[HIDDEN])]
+        owners += [CacheOwner(n, s, HIDDEN, i, g, "none") for i, (n, s, g) in enumerate(by_role[HIDDEN])]
         return Qwen4ExpKVCacheLayout(planes, tuple(owners), tuple(views), alignment, num_blocks, layout)
 
     def make_kv_cache_tensors(self, plan: Qwen4ExpKVCacheLayout) -> list[KVCacheTensor]:
@@ -410,10 +540,19 @@ class Qwen4ExpKVCachePlanner:
         for role, plane_name in anchors.items():
             role_owners = [o for o in plan.owners if o.role == role]
             for group_id in sorted({o.group_id for o in role_owners}):
-                owners = sorted((o for o in role_owners if o.group_id == group_id), key=lambda o: o.slot)
+                owners = sorted(
+                    (o for o in role_owners if o.group_id == group_id),
+                    key=lambda o: o.slot,
+                )
                 plane = plan.plane(plane_name)
                 result.append(
-                    KVCacheTensor(plane.size, [o.layer_name for o in owners], plane.layer_stride, plane.block_stride, 0)
+                    KVCacheTensor(
+                        plane.size,
+                        [o.layer_name for o in owners],
+                        plane.layer_stride,
+                        plane.block_stride,
+                        0,
+                    )
                 )
         result += [
             KVCacheTensor(

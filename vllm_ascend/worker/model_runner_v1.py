@@ -141,10 +141,7 @@ from vllm_ascend.compilation.acl_graph import (
 from vllm_ascend.compilation.breakable_aclgraph import BreakableACLGraphWrapper
 from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
 from vllm_ascend.core.qwen4_exp_kv_cache_layout import (
-    GDN,
     HIDDEN,
-    PLE,
-    QSA_MAIN,
     Qwen4ExpKVCachePlanner,
     make_plane_view,
 )
@@ -5653,12 +5650,7 @@ class NPUModelRunner(GPUModelRunner):
                                 recipes, backings, strict=True
                             )
                         ]
-                        if owner.role == QSA_MAIN:
-                            kv_caches[layer_name] = tuple(materialized)
-                        elif owner.role in (GDN, PLE):
-                            kv_caches[layer_name] = materialized
-                        else:
-                            kv_caches[layer_name] = materialized[0]
+                        kv_caches[layer_name] = owner.materialize(materialized)
                         continue
                     if owner.role != HIDDEN:
                         raise RuntimeError(

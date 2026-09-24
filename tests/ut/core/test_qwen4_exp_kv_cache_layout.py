@@ -8,6 +8,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
@@ -25,8 +26,23 @@ from vllm_ascend.patch.platform.patch_kv_cache_utils import (
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
+_DEFAULT_LAYER_TYPES = tuple(["linear_attention"] * 3 + ["qwen_sparse_attention"]) * 12
 
-def _specs(*, include_mtp: bool = False) -> dict[str, KVCacheSpec]:
+
+def _planner_config(layer_types: tuple[str, ...] = _DEFAULT_LAYER_TYPES) -> SimpleNamespace:
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(layer_types=list(layer_types)),
+        )
+    )
+
+
+def _specs(
+    *,
+    layer_types: tuple[str, ...] = _DEFAULT_LAYER_TYPES,
+    include_mtp: bool = False,
+    include_ple: bool = True,
+) -> dict[str, KVCacheSpec]:
     main = FullAttentionSpec(
         block_size=128,
         num_kv_heads=1,
@@ -64,45 +80,90 @@ def _specs(*, include_mtp: bool = False) -> dict[str, KVCacheSpec]:
         tp_replicated=True,
     )
     specs: dict[str, KVCacheSpec] = {}
-    for index in range(12):
-        source = f"model.layers.{index * 4 + 3}.self_attn"
-        specs[f"{source}.indexer.compressed_key_cache"] = compressed
-        specs[f"{source}.indexer.raw_key_cache"] = raw
-        specs[f"{source}.attn"] = main
+    for index, layer_type in enumerate(layer_types):
+        if layer_type == "qwen_sparse_attention":
+            source = f"model.layers.{index}.self_attn"
+            specs[f"{source}.indexer.compressed_key_cache"] = compressed
+            specs[f"{source}.indexer.raw_key_cache"] = raw
+            specs[f"{source}.attn"] = main
+        elif layer_type == "linear_attention":
+            specs[f"model.layers.{index}.linear_attn"] = gdn
+        else:
+            raise ValueError(f"Unsupported test layer type: {layer_type}")
     if include_mtp:
         source = "model.mtp.layers.48.self_attn"
         specs[f"{source}.indexer.compressed_key_cache"] = compressed
         specs[f"{source}.indexer.raw_key_cache"] = raw
         specs[f"{source}.attn"] = main
-    for index in range(36):
-        specs[f"model.layers.{index}.linear_attn"] = gdn
-    specs["model.ple"] = ple
+    if include_ple:
+        specs["model.ple"] = ple
     return specs
 
 
 def _groups(*, include_mtp: bool = False):
-    return Qwen4ExpKVCachePlanner().get_kv_cache_groups(_specs(include_mtp=include_mtp))
+    return Qwen4ExpKVCachePlanner(_planner_config()).get_kv_cache_groups(_specs(include_mtp=include_mtp))
 
 
 def test_standard_topology_has_six_semantic_groups() -> None:
     groups = _groups()
     assert len(groups) == 6
+    assert all(
+        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        for group in groups
+    )
+    qsa_specs = groups[0].kv_cache_spec.kv_cache_specs
+    assert {
+        type(spec) for spec in qsa_specs.values()
+    } == {FullAttentionSpec, MLAAttentionSpec}
     assert sum(name.endswith(".attn") for name in groups[0].layer_names) == 12
     assert sum(name.endswith(".compressed_key_cache") for name in groups[0].layer_names) == 12
     assert [len(group.layer_names) for group in groups[1:4]] == [12, 12, 12]
+    assert groups[1].layer_names[:2] == ["model.layers.0.linear_attn", "model.layers.4.linear_attn"]
+    assert groups[2].layer_names[:2] == ["model.layers.1.linear_attn", "model.layers.5.linear_attn"]
+    assert groups[3].layer_names[:2] == ["model.layers.2.linear_attn", "model.layers.6.linear_attn"]
     assert groups[4].layer_names == ["model.ple"]
+    assert all(
+        isinstance(spec, MambaSpec)
+        for group in groups[1:5]
+        for spec in group.kv_cache_spec.kv_cache_specs.values()
+    )
     assert all(name.endswith(".raw_key_cache") for name in groups[5].layer_names)
+    assert all(
+        isinstance(spec, CircularBufferSpec)
+        for spec in groups[5].kv_cache_spec.kv_cache_specs.values()
+    )
     assert groups[5].enable_kv_transfer is False
 
 
 def test_gdn_topology_lanes_are_derived_not_fixed() -> None:
-    specs = _specs()
-    for name in list(specs):
-        if name.endswith(".linear_attn") and int(name.split(".layers.")[1].split(".")[0]) % 3 == 2:
-            del specs[name]
-    groups = Qwen4ExpKVCachePlanner().get_kv_cache_groups(specs)
+    layer_types = tuple(["linear_attention"] * 2 + ["qwen_sparse_attention"]) * 12
+    specs = _specs(layer_types=layer_types)
+    groups = Qwen4ExpKVCachePlanner(_planner_config(layer_types)).get_kv_cache_groups(specs)
     assert len(groups) == 5
     assert [len(group.layer_names) for group in groups[1:3]] == [12, 12]
+
+
+def test_incomplete_topology_tail_does_not_require_gdn_qsa_divisibility() -> None:
+    layer_types = tuple(["linear_attention"] * 2 + ["qwen_sparse_attention"]) * 4 + ("linear_attention",)
+    specs = _specs(layer_types=layer_types)
+    groups = Qwen4ExpKVCachePlanner(_planner_config(layer_types)).get_kv_cache_groups(specs)
+    assert [len(group.layer_names) for group in groups[1:3]] == [5, 4]
+
+
+def test_qsa_only_reduced_model_does_not_require_gdn_or_ple() -> None:
+    layer_types = ("qwen_sparse_attention",)
+    specs = _specs(layer_types=layer_types, include_ple=False)
+    planner = Qwen4ExpKVCachePlanner(_planner_config(layer_types))
+    groups = planner.get_kv_cache_groups(specs)
+    assert len(groups) == 2
+    plan = planner.build_physical_plan(groups, num_blocks=2, layout=KVCacheLayout.LBNHC)
+    assert plan is not None
+    assert [plane.name for plane in plan.planes] == [
+        VALUE_OR_PLE,
+        KEY_OR_SSM,
+        COMPRESSED_KEY,
+        CIRCULAR_STATE,
+    ]
 
 
 @pytest.mark.parametrize("layout", [KVCacheLayout.BLNHC, KVCacheLayout.LBNHC])
@@ -120,7 +181,7 @@ def test_plane_geometry_follows_resolved_layout(layout: KVCacheLayout) -> None:
         128 * 256 * 2,
         128 * 256 * 2,
         1280 * 2,
-        128 * 128 * 2,
+        (128 // 4) * 128 * 2,
         8 * 130 * 2,
     ]
     assert plan.slot_count == 12
@@ -179,6 +240,28 @@ def test_config_uses_resolved_blnhc_descriptor_geometry() -> None:
     plan = Qwen4ExpKVCachePlanner().build_physical_plan(config.kv_cache_groups, 3, KVCacheLayout.BLNHC)
     assert plan is not None
     assert config.kv_cache_tensors[0].block_stride == plan.plane(KEY_OR_SSM).block_stride
+
+
+def test_config_memory_budget_counts_ring_buffer_once() -> None:
+    cache_config = SimpleNamespace(
+        num_gpu_blocks_override=None,
+        prefix_cache_retention_interval=None,
+        get_resolved_kv_cache_layout=lambda: KVCacheLayout.LBNHC,
+    )
+    vllm_config = SimpleNamespace(cache_config=cache_config)
+    groups = _groups()
+    unit_plan = Qwen4ExpKVCachePlanner().build_physical_plan(
+        groups, 1, KVCacheLayout.LBNHC
+    )
+    assert unit_plan is not None
+    bytes_per_block = unit_plan.normal_backing_size + unit_plan.ring_backing_size
+
+    config = _get_qwen4_exp_kv_cache_config(
+        vllm_config, groups, available_memory=3 * bytes_per_block
+    )
+
+    assert config is not None
+    assert config.num_blocks == 3
 
 
 def test_runner_allocates_each_plane_once_and_materializes_recipes() -> None:
