@@ -3,8 +3,9 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
-from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import KVCacheGroupSpec, UniformTypeKVCacheSpecs
 
 from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
@@ -12,6 +13,8 @@ from vllm_ascend.core.kv_cache_interface import (
     get_kv_cache_compression_ratio,
     get_storage_block_size,
 )
+from vllm_ascend.models.deepseek_v41.cache_config import is_deepseek_v41_cache
+from vllm_ascend.models.qwen4_exp.cache_config import is_qwen4_exp_cache
 
 
 def _mla_spec():
@@ -21,6 +24,28 @@ def _mla_spec():
         head_size=128,
         dtype=torch.bfloat16,
     )
+
+
+@pytest.mark.parametrize(
+    ("version", "detect"),
+    [("deepseek_v41", is_deepseek_v41_cache), ("qwen4_exp", is_qwen4_exp_cache)],
+)
+def test_model_version_detection_accepts_raw_and_grouped_specs(version, detect):
+    spec = AscendMLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        model_version=version,
+    )
+    uniform = UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs={"renamed": spec})
+    group = KVCacheGroupSpec(layer_names=["renamed"], kv_cache_spec=uniform)
+    for items in ({"renamed": spec}, [spec], [uniform], [group], iter([_mla_spec(), group])):
+        assert detect(items)
+    other_detect = is_qwen4_exp_cache if version == "deepseek_v41" else is_deepseek_v41_cache
+    assert not other_detect([group])
+    assert not detect([_mla_spec()])
+    assert not detect([])
 
 
 def test_get_storage_block_size_and_dcp_memory():

@@ -23,12 +23,8 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_kind,
 )
 
-from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
-from vllm_ascend.core.qwen4_exp_kv_cache_layout import (
-    CIRCULAR_STATE,
-    HIDDEN,
-    Qwen4ExpKVCachePlanner,
-    build_qwen4_exp_kv_cache_layout,
+from vllm_ascend.core.kv_cache_interface import (
+    is_prefix_cacheable,
 )
 from vllm_ascend.models.deepseek_v41.cache_config import (
     get_deepseek_v41_kv_cache_config,
@@ -45,6 +41,14 @@ from vllm_ascend.models.glm5next.cache_config import (
     get_glm5_next_pool_bytes_per_block,
 )
 from vllm_ascend.models.glm5next.kv_cache import is_glm5_next_cache_spec
+from vllm_ascend.models.qwen4_exp.cache_config import (
+    get_qwen4_exp_allocation_overhead,
+    get_qwen4_exp_kv_cache_config,
+    get_qwen4_exp_kv_cache_groups,
+    get_qwen4_exp_pool_bytes_per_block,
+    is_qwen4_exp_cache,
+    project_qwen4_exp_cache_groups,
+)
 from vllm_ascend.utils import vllm_version_is
 
 _KIMI_K3_TARGET_LAYER_PREFIX = "language_model.model.layers."
@@ -61,6 +65,32 @@ else:
 _orig_get_kv_cache_config_from_groups = vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups
 _orig_max_memory_usage_bytes_from_groups = vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups
 _orig_pool_bytes_per_block = vllm.v1.core.kv_cache_utils._pool_bytes_per_block
+_orig_validate_kv_cache_layout = vllm.v1.core.kv_cache_utils.validate_kv_cache_layout
+_orig_project_kv_cache_groups = getattr(vllm.v1.core.kv_cache_utils, "_project_kv_cache_groups_to_worker", None)
+
+
+def _ascend_validate_kv_cache_layout(layout, groups):
+    if is_qwen4_exp_cache(groups):
+        # Qwen's four uniform row pages express mixed payloads in LBNHC.
+        # The generic planner's single packed page restriction does not apply.
+        if layout.name != "LBNHC":
+            raise ValueError("Qwen4Exp packed cache requires LBNHC")
+        return
+    return _orig_validate_kv_cache_layout(layout, groups)
+
+
+vllm.v1.core.kv_cache_utils.validate_kv_cache_layout = _ascend_validate_kv_cache_layout
+
+
+def _ascend_project_kv_cache_groups_to_worker(groups, worker_specs):
+    if is_qwen4_exp_cache(groups):
+        return project_qwen4_exp_cache_groups(groups, worker_specs)
+    assert _orig_project_kv_cache_groups is not None
+    return _orig_project_kv_cache_groups(groups, worker_specs)
+
+
+if _orig_project_kv_cache_groups is not None:
+    vllm.v1.core.kv_cache_utils._project_kv_cache_groups_to_worker = _ascend_project_kv_cache_groups_to_worker
 if UniformTypeKVCacheSpecs.max_num_blocks_per_req is KVCacheSpec.max_num_blocks_per_req:
 
     def _uniform_type_max_num_blocks_per_req(
@@ -110,7 +140,7 @@ def _ascend_resolve_kv_cache_block_sizes(
     groups = kv_cache_config.kv_cache_groups
     cacheable_groups = [group for group in groups if is_prefix_cacheable(group.kv_cache_spec)]
     filtered_private_groups = bool(cacheable_groups) and len(cacheable_groups) != len(groups)
-    if filtered_private_groups and not is_deepseek_v41_cache(groups):
+    if filtered_private_groups and not is_deepseek_v41_cache(groups) and not is_qwen4_exp_cache(groups):
         # A fixed tail block is not a token-page scheduling or hashing unit.
         # Pool alignment is enforced by the GLM planner and prefix coordinator.
         kv_cache_config = replace(kv_cache_config, kv_cache_groups=cacheable_groups)
@@ -469,7 +499,9 @@ def _ascend_get_packed_kv_cache_groups(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec] | None:
     """Preserve Ascend's DSV4 grouping on the live packed-group hook."""
-    if is_deepseek_v41_cache(kv_cache_spec):
+    if is_qwen4_exp_cache(kv_cache_spec):
+        groups = get_qwen4_exp_kv_cache_groups(vllm_config, kv_cache_spec)
+    elif is_deepseek_v41_cache(kv_cache_spec):
         grouped_specs = group_cache_specs(kv_cache_spec)
         groups = make_cache_groups(grouped_specs)
     else:
@@ -626,21 +658,21 @@ def _ascend_pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int
     """
     if is_deepseek_v41_cache(kv_cache_groups):
         return get_deepseek_v41_pool_bytes_per_block(kv_cache_groups)
+    if is_qwen4_exp_cache(kv_cache_groups):
+        return get_qwen4_exp_pool_bytes_per_block(kv_cache_groups)
     if _get_glm5_next_cache_layout(kv_cache_groups) is not None:
         return get_glm5_next_pool_bytes_per_block(kv_cache_groups)
-    if not vllm_version_is("0.28.0"):
-        qwen_layout = build_qwen4_exp_kv_cache_layout(
-            kv_cache_groups,
-            num_blocks=1,
-        )
-        if qwen_layout is not None:
-            hidden_bytes = sum(owner.spec.page_size_bytes for owner in qwen_layout.owners if owner.role == HIDDEN)
-            return qwen_layout.normal_backing_size + qwen_layout.ring_backing_size + hidden_bytes
     if not _is_deepseek_v4_groups(kv_cache_groups):
         return _orig_pool_bytes_per_block(kv_cache_groups)
 
     page_sizes, _, _, _, num_layer_tuples = _get_deepseek_v4_cache_layout(kv_cache_groups)
     return sum(page_sizes) * num_layer_tuples
+
+
+def _ascend_pool_allocation_overhead(vllm_config, kv_cache_groups) -> int:
+    if is_qwen4_exp_cache(kv_cache_groups):
+        return get_qwen4_exp_allocation_overhead(vllm_config, kv_cache_groups)
+    return 0
 
 
 def _ascend_max_memory_usage_bytes_from_groups(
@@ -650,22 +682,17 @@ def _ascend_max_memory_usage_bytes_from_groups(
     """Keep the pre-#51718 DSV4 admission formula for its shared tuples."""
     if _get_glm5_next_cache_layout(kv_cache_groups) is not None:
         return get_glm5_next_max_memory_usage(vllm_config, kv_cache_groups)
-    if not vllm_version_is("0.28.0"):
-        qwen_layout = build_qwen4_exp_kv_cache_layout(
-            kv_cache_groups,
-            num_blocks=1,
-        )
-        if qwen_layout is not None:
-            hidden_bytes = sum(owner.spec.page_size_bytes for owner in qwen_layout.owners if owner.role == HIDDEN)
-            bytes_per_pool_block = qwen_layout.normal_backing_size + qwen_layout.ring_backing_size + hidden_bytes
-            required_pool_blocks = sum(
-                cdiv(
-                    group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
-                    group.kv_cache_spec.page_size_bytes,
-                )
-                for group in kv_cache_groups
+    if is_qwen4_exp_cache(kv_cache_groups):
+        required_pool_blocks = sum(
+            cdiv(
+                group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                group.kv_cache_spec.page_size_bytes,
             )
-            return required_pool_blocks * bytes_per_pool_block
+            for group in kv_cache_groups
+        )
+        return required_pool_blocks * get_qwen4_exp_pool_bytes_per_block(
+            kv_cache_groups
+        ) + get_qwen4_exp_allocation_overhead(vllm_config, kv_cache_groups)
     if vllm_version_is("0.28.0") or not _is_deepseek_v4_groups(kv_cache_groups):
         return _orig_max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups)
 
@@ -691,71 +718,14 @@ def _get_ascend_kv_cache_groups(
 ) -> list[KVCacheGroupSpec]:
     if any(is_glm5_next_cache_spec(spec) for spec in kv_cache_spec.values()):
         return get_glm5_next_kv_cache_groups(vllm_config, kv_cache_spec)
-    if Qwen4ExpKVCachePlanner.is_applicable(kv_cache_spec):
-        groups = Qwen4ExpKVCachePlanner(vllm_config).get_kv_cache_groups(kv_cache_spec)
+    if is_qwen4_exp_cache(kv_cache_spec):
+        groups = get_qwen4_exp_kv_cache_groups(vllm_config, kv_cache_spec)
         logger.info(
-            "Using Qwen3.8 component-aware grouping with %d cache groups",
+            "Using Qwen4Exp split-row grouping with %d cache groups",
             len(groups),
         )
         return groups
     return _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
-
-
-def _get_qwen4_exp_kv_cache_config(
-    vllm_config: VllmConfig,
-    kv_cache_groups: list[KVCacheGroupSpec],
-    available_memory: int,
-) -> KVCacheConfig | None:
-    """Plan four packed tensor planes and one independent RingBuffer.
-
-    The main descriptor API cannot express that one logical QSA/GDN owner has
-    two disjoint physical regions.  Descriptors therefore publish the anchor
-    region and shared backing geometry; the Ascend runner reconstructs every
-    role from the same capability-derived layout.  Different cache groups
-    deliberately alias the same allocation because a physical block ID is
-    owned by only one group at a time.
-    """
-    if vllm_version_is("0.28.0"):
-        return None
-    planner = Qwen4ExpKVCachePlanner(vllm_config)
-    resolved_layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
-    probe = planner.build_physical_plan(kv_cache_groups, num_blocks=1, layout=resolved_layout)
-    if probe is None:
-        return None
-
-    hidden_owners = [owner for owner in probe.owners if owner.role == HIDDEN]
-    hidden_bytes_per_block = sum(owner.spec.page_size_bytes for owner in hidden_owners)
-    normal_bytes_per_block = sum(
-        plane.page_size_bytes * plane.slot_count
-        for plane in probe.planes
-        if plane.name != CIRCULAR_STATE
-    )
-    ring_bytes_per_block = probe.ring_page_size_bytes * probe.ring_slot_count
-    bytes_per_block = normal_bytes_per_block + ring_bytes_per_block + hidden_bytes_per_block
-    candidate = available_memory // bytes_per_block
-    while candidate > 0:
-        candidate_layout = planner.build_physical_plan(kv_cache_groups, num_blocks=candidate, layout=resolved_layout)
-        assert candidate_layout is not None
-        required = (
-            candidate_layout.normal_backing_size
-            + candidate_layout.ring_backing_size
-            + hidden_bytes_per_block * candidate
-        )
-        if required <= available_memory:
-            break
-        candidate -= 1
-    num_blocks = may_override_num_blocks(vllm_config, candidate)
-    layout = planner.build_physical_plan(kv_cache_groups, num_blocks=num_blocks, layout=resolved_layout)
-    assert layout is not None
-    tensors = planner.make_kv_cache_tensors(layout)
-
-    return KVCacheConfig(
-        num_blocks=num_blocks,
-        kv_cache_tensors=tensors,
-        kv_cache_groups=kv_cache_groups,
-        prefix_cache_retention_interval=(vllm_config.cache_config.prefix_cache_retention_interval),
-        kv_cache_layout=resolved_layout.name,
-    )
 
 
 def _ascend_get_kv_cache_config_from_groups(
@@ -773,9 +743,12 @@ def _ascend_get_kv_cache_config_from_groups(
     ``copy.deepcopy`` in ``generate_scheduler_kv_cache_config`` and is
     dropped by worker pickle IPC, which never reads it.
     """
-    qwen_config = _get_qwen4_exp_kv_cache_config(vllm_config, kv_cache_groups, available_memory)
-    if qwen_config is not None:
-        kv_cache_config = qwen_config
+    if is_qwen4_exp_cache(kv_cache_groups):
+        kv_cache_config = get_qwen4_exp_kv_cache_config(
+            vllm_config,
+            kv_cache_groups,
+            available_memory,
+        )
     elif is_deepseek_v41_cache(kv_cache_groups):
         kv_cache_config = get_deepseek_v41_kv_cache_config(vllm_config, kv_cache_groups, available_memory)
     elif _get_glm5_next_cache_layout(kv_cache_groups) is not None:
@@ -815,6 +788,7 @@ KVCacheConfig.has_mamba_layers = property(  # type: ignore[assignment]
 vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups = _ascend_get_kv_cache_config_from_groups
 vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups = _ascend_max_memory_usage_bytes_from_groups
 vllm.v1.core.kv_cache_utils._pool_bytes_per_block = _ascend_pool_bytes_per_block
+vllm.v1.core.kv_cache_utils._pool_allocation_overhead = _ascend_pool_allocation_overhead
 
 # Also patch the reference used by engine/core.py which imports the function directly.
 import vllm.v1.engine.core  # noqa: E402

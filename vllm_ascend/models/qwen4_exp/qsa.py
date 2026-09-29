@@ -14,9 +14,11 @@
 
 """Ascend QSA owner for Qwen3.8-Flash-Next."""
 
+from dataclasses import replace
 from typing import Protocol, TypeAlias, cast
 
 import torch
+from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.models.qwen4_exp.amd import (
     indexer_qsa as upstream_indexer,
@@ -27,6 +29,8 @@ from vllm.models.qwen4_exp.common.qsa_cache import (
     QSAForwardMetadata,
 )
 from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
+from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from vllm_ascend import envs
 from vllm_ascend.ops.triton.qwen4_exp.qsa import (
@@ -51,6 +55,13 @@ from .ops import (
 )
 
 QSAKVCache: TypeAlias = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+
+
+class AscendQSACompressedKeyCache(qsa_cache.QSACompressedKeyCache):
+    """Identify Qwen4Exp specs before the scheduler chooses its cache planner."""
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        return replace(super().get_kv_cache_spec(vllm_config), model_version="qwen4_exp")
 
 
 class QSAForwardMetadataProtocol(Protocol):
@@ -447,7 +458,17 @@ class AscendQSAImpl:
         )
 
 
+class AscendQSAStateBackend(qsa_cache.QSAStateBackend):
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        return (KVCacheLayout.LBNHC,)
+
+
 class AscendQSABackend(upstream_qsa.Qwen4ExpQSAFlashAttentionBackend):
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        return (KVCacheLayout.LBNHC,)
+
     @staticmethod
     def get_name() -> str:
         return "QWEN4_EXP_QSA_ASCEND"
@@ -459,7 +480,9 @@ class AscendQSABackend(upstream_qsa.Qwen4ExpQSAFlashAttentionBackend):
 
 # The upstream owner resolves these names from its module globals during
 # construction. Replace only the platform-specific components, leaving model
-# structure, cache specifications and weight mapping in upstream vLLM.
+# structure, cache geometry and weight mapping in upstream vLLM.
+qsa_cache.QSAStateBackend = AscendQSAStateBackend
+upstream_indexer.QSACompressedKeyCache = AscendQSACompressedKeyCache
 upstream_indexer.apply_qsa_rope = apply_qsa_rope
 upstream_qsa.QSAIndexer = AscendQSAIndexer
 upstream_qsa.Qwen4ExpQSAFlashAttentionImpl = AscendQSAImpl

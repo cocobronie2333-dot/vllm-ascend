@@ -140,11 +140,6 @@ from vllm_ascend.compilation.acl_graph import (
 )
 from vllm_ascend.compilation.breakable_aclgraph import BreakableACLGraphWrapper
 from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
-from vllm_ascend.core.qwen4_exp_kv_cache_layout import (
-    HIDDEN,
-    Qwen4ExpKVCachePlanner,
-    make_plane_view,
-)
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
     apply_layerwise_kv_cache_plan,
@@ -163,6 +158,11 @@ from vllm_ascend.eplb.eplb_updator import EplbUpdator
 from vllm_ascend.model_executor.offloader import create_offloader
 from vllm_ascend.models.deepseek_v41.cache_config import (
     is_deepseek_v41_cache,
+)
+from vllm_ascend.models.qwen4_exp.cache_config import (
+    allocate_qwen4_exp_kv_cache_tensors,
+    is_qwen4_exp_cache,
+    reshape_qwen4_exp_kv_cache_tensors,
 )
 from vllm_ascend.ops.fused_moe.force_eplb import build_force_eplb_topk
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
@@ -5106,13 +5106,20 @@ class NPUModelRunner(GPUModelRunner):
             to their corresponding memory buffer for K cache and V cache.
         """
         if self.ascend_config.kvpp_config.size > 1:
+            if is_qwen4_exp_cache(kv_cache_config.kv_cache_groups):
+                raise NotImplementedError("Qwen4Exp packed cache does not support KV pipeline parallelism")
             self.hybrid_with_attn_and_mamba = False
             return allocate_kvpp_cache(self.vllm_config, kv_cache_config, self.device)
-        # init kv cache tensors
-        kv_cache_raw_tensors: dict[str, torch.Tensor | tuple[torch.Tensor, ...]] = {}
-        # prefill disaggregation need the addr of cache tensor be aligned with 2M
-        alignment = 2 * 1024 * 1024
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
+        if is_qwen4_exp_cache(kv_cache_config.kv_cache_groups):
+            self.hybrid_with_attn_and_mamba = any(
+                isinstance(spec, MambaSpec) for spec in layer_kv_cache_spec.values()
+            )
+            caches = allocate_qwen4_exp_kv_cache_tensors(kv_cache_config, self._allocate_int8_cache_tensor)
+            return {name: cache for name, cache in caches.items() if name not in self.runner_only_attn_layers}
+        kv_cache_raw_tensors: dict[str, torch.Tensor | tuple[torch.Tensor, ...]] = {}
+        # Prefill disaggregation requires cache addresses aligned to 2 MiB.
+        alignment = 2 * 1024 * 1024
         if is_deepseek_v41_cache(layer_kv_cache_spec):
             # V4.1 overlays the layers in each tuple on one physical slot.
             # Unlike DSV4's shared-tuple layout below, each descriptor owns
@@ -5122,9 +5129,6 @@ class NPUModelRunner(GPUModelRunner):
                 for name in allocation.layers:
                     kv_cache_raw_tensors[name] = backing
             return kv_cache_raw_tensors
-        # v0.28 uses descriptor-level shared_by allocations; the current main
-        # planner instead describes offsets into a standardized backing.
-        use_legacy_shared_by_layout = vllm_version_is("0.28.0")
         uses_padded_page_layout = requires_padded_page_layout(layer_kv_cache_spec.values())
         is_dsv4_main = any(
             getattr(spec, "model_version", None) == "deepseek_v4"
@@ -5143,67 +5147,6 @@ class NPUModelRunner(GPUModelRunner):
         supports_shared_backing_with_kv_transfer = (
             self.supports_shared_backing_with_kv_transfer
         )
-
-        qwen4_exp_layout = (
-            None
-            if use_legacy_shared_by_layout
-            else Qwen4ExpKVCachePlanner(self.vllm_config).build_physical_plan(
-                kv_cache_config.kv_cache_groups, kv_cache_config.num_blocks
-            )
-        )
-        uses_qwen4_exp_layout = (
-            qwen4_exp_layout is not None
-            and not is_dsv4_main
-            and not uses_padded_page_layout
-            and supports_shared_backing_with_kv_transfer
-        )
-        self._qwen4_exp_kv_cache_layout = (
-            qwen4_exp_layout if uses_qwen4_exp_layout else None
-        )
-
-        uses_page_strided_shared_backing = (
-            not uses_qwen4_exp_layout
-            and not is_dsv4_main
-            and not uses_padded_page_layout
-            and supports_shared_backing_with_kv_transfer
-            and self._uses_page_strided_shared_backing(
-                kv_cache_config,
-                layer_kv_cache_spec,
-            )
-        )
-        self._page_strided_shared_backing = uses_page_strided_shared_backing
-
-        if uses_qwen4_exp_layout:
-            assert qwen4_exp_layout is not None
-            plane_backings = {
-                plane.name: self._allocate_int8_cache_tensor(
-                    plane.size,
-                    alignment,
-                )
-                for plane in qwen4_exp_layout.planes
-            }
-            for owner in qwen4_exp_layout.owners:
-                views = qwen4_exp_layout.owner_views(owner.layer_name)
-                if not views:
-                    continue
-                backings = tuple(plane_backings[view.plane_name] for view in views)
-                kv_cache_raw_tensors[owner.layer_name] = (
-                    backings[0] if len(backings) == 1 else backings
-                )
-
-        if uses_page_strided_shared_backing:
-            backing_sizes = {
-                descriptor.size
-                for descriptor in kv_cache_config.kv_cache_tensors
-            }
-            assert len(backing_sizes) == 1
-            backing = self._allocate_int8_cache_tensor(
-                backing_sizes.pop(),
-                alignment,
-            )
-            for descriptor in kv_cache_config.kv_cache_tensors:
-                for layer_name in get_kv_cache_tensor_layers(descriptor):
-                    kv_cache_raw_tensors[layer_name] = backing
 
         # GLM-Next emits one descriptor for each physical cache slot. Layers
         # listed by a descriptor deliberately alias that slot even when they
@@ -5297,7 +5240,6 @@ class NPUModelRunner(GPUModelRunner):
         if (
             not is_dsv4_main
             and not uses_padded_page_layout
-            and not uses_qwen4_exp_layout
             and self.hybrid_with_attn_and_mamba
             and supports_shared_backing_with_kv_transfer
             and not self.use_sparse
@@ -5539,9 +5481,7 @@ class NPUModelRunner(GPUModelRunner):
     def _reshape_kv_cache_tensors(
         self,
         kv_cache_config: KVCacheConfig,
-        kv_cache_raw_tensors: dict[
-            str, torch.Tensor | tuple[torch.Tensor, ...]
-        ],
+        kv_cache_raw_tensors: dict[str, torch.Tensor | tuple[torch.Tensor, ...]],
     ) -> dict[str, torch.Tensor]:
         """
         Reshape the KV cache tensors to the desired shape and dtype.
@@ -5554,6 +5494,8 @@ class NPUModelRunner(GPUModelRunner):
             Dict[str, torch.Tensor]: A map between layer names to their
             corresponding memory buffer for KV cache.
         """
+        if is_qwen4_exp_cache(kv_cache_config.kv_cache_groups):
+            return reshape_qwen4_exp_kv_cache_tensors(kv_cache_config, kv_cache_raw_tensors)
         kv_caches: dict[str, torch.Tensor] = {}
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
         uses_padded_page_layout = requires_padded_page_layout(layer_kv_cache_spec.values())
@@ -5565,11 +5507,6 @@ class NPUModelRunner(GPUModelRunner):
                 for name in descriptor.layers
             }
 
-        qwen4_exp_layout = getattr(
-            self,
-            "_qwen4_exp_kv_cache_layout",
-            None,
-        )
         uses_page_strided_shared_backing = getattr(
             self,
             "_page_strided_shared_backing",
@@ -5628,35 +5565,6 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     kv_caches[layer_name] = tuple(views) if is_index else views[0]
                     continue
-                if qwen4_exp_layout is not None:
-                    owner = qwen4_exp_layout.owner(layer_name)
-                    recipes = qwen4_exp_layout.owner_views(layer_name)
-                    if recipes:
-                        raw_allocation = kv_cache_raw_tensors[layer_name]
-                        backings = (
-                            raw_allocation
-                            if isinstance(raw_allocation, tuple)
-                            else (raw_allocation,)
-                        )
-                        materialized = [
-                            make_plane_view(
-                                backing,
-                                plane=qwen4_exp_layout.plane(recipe.plane_name),
-                                slot=recipe.slot,
-                                dtype=recipe.dtype,
-                                item_shape=recipe.item_shape,
-                            )
-                            for recipe, backing in zip(
-                                recipes, backings, strict=True
-                            )
-                        ]
-                        kv_caches[layer_name] = owner.materialize(materialized)
-                        continue
-                    if owner.role != HIDDEN:
-                        raise RuntimeError(
-                            f"Unsupported Qwen4Exp packed-cache owner {owner}."
-                        )
-
                 packed_descriptor = packed_descriptors.get(layer_name)
                 if (
                     packed_descriptor is not None
@@ -6199,6 +6107,11 @@ class NPUModelRunner(GPUModelRunner):
                 selected_kernel_size = select_common_block_size(
                     kv_manager_block_size, backends
                 )
+                if (
+                    is_qwen4_exp_cache(kv_cache_config.kv_cache_groups)
+                    and selected_kernel_size != kv_manager_block_size
+                ):
+                    raise ValueError("Qwen4Exp packed pages cannot be split into smaller kernel blocks")
                 self.kernel_block_sizes.append([selected_kernel_size])
             else:
                 # This is likely Mamba or other non-attention cache,
