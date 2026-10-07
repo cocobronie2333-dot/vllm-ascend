@@ -21,7 +21,8 @@ MAX_LATENCY_RATIO = 1.05
 
 
 @pytest.mark.parametrize("tokens", [8, 128, 384])
-def test_host_uva_tiled_simd_latency(tokens, monkeypatch):
+@pytest.mark.parametrize("vectorcore_divisor", [2, 4])
+def test_host_uva_tiled_simd_latency(tokens, vectorcore_divisor, monkeypatch):
     if not hasattr(torch, "npu") or not torch.npu.is_available():
         pytest.skip("NPU required")
     torch.npu.set_device(0)
@@ -49,7 +50,9 @@ def test_host_uva_tiled_simd_latency(tokens, monkeypatch):
             outputs.append(output)
 
             def lookup(output=output):
-                npu.gather_dequantize_host_uva(codes, scales, ids, local_heads=HEADS, output=output)
+                npu.gather_dequantize_host_uva(
+                    codes, scales, ids, local_heads=HEADS, output=output, vectorcore_divisor=vectorcore_divisor
+                )
 
             for _ in range(5):
                 lookup()

@@ -22,10 +22,9 @@ from vllm.triton_utils import tl, triton
 from vllm_ascend.device.hardware_profile import EngramUvaBackend, get_current_hardware_profile
 
 SCALE_GROUP = 32
-# Cap HOST_UVA lookup parallelism so Engram leaves vector-core capacity for
-# latency-sensitive model work. The cap is a tuning point, not a hardware core
-# count: validate it against end-to-end latency on the target Ascend device.
-UVA_MAX_PROGRAMS = 8
+# Derive the HOST_UVA program limit from the detected vector-core count.
+# The fraction is a tuning point; validate contention with model work separately.
+UVA_VECTORCORE_DIVISOR = 4
 # Expose roughly one full model's worth of hash heads in each FP8 program,
 # including when TP or EDP leaves only a few local heads per rank.
 UVA_FP8_ROWS_PER_TILE = 24
@@ -44,7 +43,7 @@ UVA_FP8_ROW_TILE_SHAPE = (24, 256)
 UVA_FP8_ROW_TILE_SIZE = 16
 UVA_FP8_ROW_TILE_MIN_TOKENS = 9
 # A3 software FP8 decoding favors smaller vector tiles for short lookups.
-# Measured with 24 heads, width 256 and eight programs; keep T=1 row-wise.
+# Keep the measured 24-head, width-256 tile policy; T=1 remains row-wise.
 UVA_FP8_SIMD_MIN_TOKENS = 2
 UVA_FP8_SIMD_MEDIUM_TILE_MIN_TOKENS = 5
 UVA_FP8_SIMD_LARGE_TILE_MIN_TOKENS = 32
@@ -371,18 +370,20 @@ def _engram_host_uva_gather_dequant_fp8_small_kernel(
     HEAD_START: tl.constexpr,
     LOCAL_HEADS: tl.constexpr,
     PAD_HEADS: tl.constexpr,
+    ROWS: tl.constexpr,
     ROWS_PER_PROGRAM: tl.constexpr,
 ):
-    # The 24-head specialization divides evenly across eight programs. Keep
-    # native vector FP8 conversion and unroll only bounded, short lookups.
+    # Dynamic program counts need not divide the rows evenly. Mask the tail
+    # while retaining native FP8 conversion and bounded loop unrolling.
     col = tl.arange(0, WIDTH)
     groups = tl.arange(0, WIDTH // GROUP)
     for row_slot in tl.static_range(ROWS_PER_PROGRAM):
         row = tl.program_id(0) + row_slot * tl.num_programs(0)
+        active = row < ROWS
         token = row // LOCAL_HEADS
         head_local = row % LOCAL_HEADS
-        index = tl.load(ids + token * ids_stride_t + HEAD_START + head_local).to(tl.int64)
-        owned = (index >= vocab_start) & (index < vocab_end)
+        index = tl.load(ids + token * ids_stride_t + HEAD_START + head_local, mask=active, other=-1).to(tl.int64)
+        owned = active & (index >= vocab_start) & (index < vocab_end)
         local_row = tl.where(owned, index - vocab_start, 0)
         chunk = local_row // CHUNK
         local = local_row % CHUNK
@@ -392,7 +393,11 @@ def _engram_host_uva_gather_dequant_fp8_small_kernel(
         scale = _decode_e8m0(tl.load(scales + local * (WIDTH // GROUP) + groups))
         values = tl.reshape(values, (WIDTH // GROUP, GROUP)) * scale[:, None]
         result = tl.reshape(values, (WIDTH,)).to(tl.bfloat16)
-        tl.store(output + (token * PAD_HEADS + head_local) * WIDTH + col, tl.where(owned, result, 0))
+        tl.store(
+            output + (token * PAD_HEADS + head_local) * WIDTH + col,
+            tl.where(owned, result, 0),
+            mask=active,
+        )
 
 
 @triton.jit
@@ -529,6 +534,15 @@ def _engram_host_uva_gather_dequant_fp8_simd_kernel(
         )
 
 
+def _get_uva_program_limit(vectorcore_divisor: int = UVA_VECTORCORE_DIVISOR) -> int:
+    from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num, init_device_properties_triton
+
+    if vectorcore_divisor < 1:
+        raise ValueError("vectorcore_divisor must be positive")
+    init_device_properties_triton()
+    return max(1, get_vectorcore_num() // vectorcore_divisor)
+
+
 def gather_dequantize_host_uva(
     codes: HostUvaBuffer,
     scales: HostUvaBuffer | None,
@@ -540,14 +554,14 @@ def gather_dequantize_host_uva(
     output: torch.Tensor | None = None,
     vocab_start: int = 0,
     vocab_end: int | None = None,
+    vectorcore_divisor: int = UVA_VECTORCORE_DIVISOR,
 ) -> torch.Tensor:
     """Gather registered host rows, preserving BF16 when scales are absent.
 
     Returns ``[tokens * pad_heads, width]``; the head path views it as
-    ``[tokens, pad_heads, width]``.
+    ``[tokens, pad_heads, width]``. The program limit is the detected vector-core
+    count divided by ``vectorcore_divisor``, with at least one program.
     """
-
-    from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 
     pad_heads = local_heads if pad_heads is None else pad_heads
     width = codes.tensor.shape[-1]
@@ -558,7 +572,7 @@ def gather_dequantize_host_uva(
         output = torch.empty((tokens * pad_heads, width), dtype=torch.bfloat16, device=ids.device)
     if rows == 0:
         return output
-    init_device_properties_triton()
+    max_programs = _get_uva_program_limit(vectorcore_divisor)
     backend = get_current_hardware_profile().engram_uva_backend
     native_fp8 = backend == EngramUvaBackend.NATIVE_FP8_SIMT
     tiled_fp8 = (
@@ -574,7 +588,7 @@ def gather_dequantize_host_uva(
         and (local_heads, width) == UVA_FP8_ROW_TILE_SHAPE
         and tokens >= UVA_FP8_SIMD_MIN_TOKENS
     ):
-        # Small batches need narrower tiles to use the eight programs without
+        # Small batches need narrower tiles to use the bounded grid without
         # paying for mostly masked rows. Larger batches amortize 16-row tiles.
         if tokens < UVA_FP8_SIMD_MEDIUM_TILE_MIN_TOKENS:
             block_rows = UVA_FP8_SIMD_SMALL_TILE_SIZE
@@ -582,7 +596,7 @@ def gather_dequantize_host_uva(
             block_rows = UVA_FP8_SIMD_MEDIUM_TILE_SIZE
         else:
             block_rows = UVA_FP8_ROW_TILE_SIZE
-        _engram_host_uva_gather_dequant_fp8_simd_kernel[(UVA_MAX_PROGRAMS,)](
+        _engram_host_uva_gather_dequant_fp8_simd_kernel[(max_programs,)](
             codes.ptrs,
             scales.ptrs,
             ids,
@@ -607,7 +621,8 @@ def gather_dequantize_host_uva(
         row_tiled = (local_heads, width) == UVA_FP8_ROW_TILE_SHAPE
         if row_tiled:
             if tokens < UVA_FP8_ROW_TILE_MIN_TOKENS:
-                _engram_host_uva_gather_dequant_fp8_small_kernel[(UVA_MAX_PROGRAMS,)](
+                num_programs = min(rows, max_programs)
+                _engram_host_uva_gather_dequant_fp8_small_kernel[(num_programs,)](
                     codes.ptrs,
                     scales.ptrs,
                     ids,
@@ -621,7 +636,8 @@ def gather_dequantize_host_uva(
                     HEAD_START=head_start,
                     LOCAL_HEADS=local_heads,
                     PAD_HEADS=pad_heads,
-                    ROWS_PER_PROGRAM=rows // UVA_MAX_PROGRAMS,
+                    ROWS=rows,
+                    ROWS_PER_PROGRAM=triton.cdiv(rows, num_programs),
                     num_warps=4,
                 )
                 return output
@@ -631,9 +647,9 @@ def gather_dequantize_host_uva(
         else:
             block_rows = triton.next_power_of_2(tile_tokens * local_heads)
             num_tiles = triton.cdiv(tokens, tile_tokens)
-            use_tiled = num_tiles >= UVA_MAX_PROGRAMS * UVA_FP8_MIN_TILES_PER_PROGRAM
+            use_tiled = num_tiles >= max_programs * UVA_FP8_MIN_TILES_PER_PROGRAM
         if block_rows <= UVA_FP8_MAX_BLOCK_ROWS and use_tiled:
-            _engram_host_uva_gather_dequant_fp8_token_kernel[(min(num_tiles, UVA_MAX_PROGRAMS),)](
+            _engram_host_uva_gather_dequant_fp8_token_kernel[(min(num_tiles, max_programs),)](
                 codes.ptrs,
                 scales.ptrs,
                 ids,
@@ -660,7 +676,7 @@ def gather_dequantize_host_uva(
     # the request size does not require a new row-count specialization.
     # A3 uses SIMD for both INT8/FP32 model storage and byte-decoded FP8 inputs,
     # without requiring native FP8 conversion or a SIMT compilation backend.
-    num_programs = min(rows, UVA_MAX_PROGRAMS)
+    num_programs = min(rows, max_programs)
     # The kernel widens loaded IDs to int64; no extra cast/copy is needed here.
     _engram_host_uva_gather_dequant_kernel[(num_programs,)](
         codes.ptrs,

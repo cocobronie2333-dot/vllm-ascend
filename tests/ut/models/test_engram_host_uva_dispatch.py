@@ -16,12 +16,15 @@ from vllm_ascend.ops.triton import triton_utils
 
 
 @pytest.mark.parametrize("device_type", list(AscendDeviceType))
+@pytest.mark.parametrize("vectorcores", [32, 40, 48])
+@pytest.mark.parametrize("vectorcore_divisor", [2, 4])
 @pytest.mark.parametrize("tokens", [0, 1, 2, 4, 5, 8, 9, 17, 31, 32, 128])
 @pytest.mark.parametrize("width", [128, 256])
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.int8, torch.bfloat16])
-def test_host_uva_dispatch(device_type, tokens, width, dtype, monkeypatch):
+def test_host_uva_dispatch(device_type, vectorcores, vectorcore_divisor, tokens, width, dtype, monkeypatch):
     monkeypatch.setattr(npu, "get_current_hardware_profile", lambda: get_hardware_profile(device_type))
     monkeypatch.setattr(triton_utils, "init_device_properties_triton", lambda: None)
+    monkeypatch.setattr(triton_utils, "get_vectorcore_num", lambda: vectorcores)
     names = (
         "_engram_host_uva_gather_dequant_kernel",
         "_engram_host_uva_gather_dequant_fp8_small_kernel",
@@ -35,7 +38,12 @@ def test_host_uva_dispatch(device_type, tokens, width, dtype, monkeypatch):
     scales = None if dtype == torch.bfloat16 else SimpleNamespace(ptrs=object())
     ids = torch.zeros((tokens, 24), dtype=torch.int32)
     output = torch.empty((tokens * 24, width), dtype=torch.bfloat16)
-    assert npu.gather_dequantize_host_uva(codes, scales, ids, local_heads=24, output=output) is output
+    assert (
+        npu.gather_dequantize_host_uva(
+            codes, scales, ids, local_heads=24, output=output, vectorcore_divisor=vectorcore_divisor
+        )
+        is output
+    )
     if not tokens:
         assert all(not kernel.__getitem__.called for kernel in kernels)
         return
@@ -51,7 +59,13 @@ def test_host_uva_dispatch(device_type, tokens, width, dtype, monkeypatch):
     for index, kernel in enumerate(kernels):
         assert kernel.__getitem__.call_count == (1 if index == selected else 0)
     grid = kernels[selected].__getitem__.call_args.args[0]
-    assert grid == (8,)
+    limit = max(1, vectorcores // vectorcore_divisor)
+    expected_programs = min(tokens * 24, limit)
+    if selected == 2:
+        expected_programs = min((tokens * 24 + npu.UVA_FP8_ROW_TILE_SIZE - 1) // npu.UVA_FP8_ROW_TILE_SIZE, limit)
+    elif selected == 3:
+        expected_programs = limit
+    assert grid == (expected_programs,)
     kwargs = kernels[selected].__getitem__.return_value.call_args.kwargs
     if device_type != AscendDeviceType.A5:
         assert kwargs["compile_mode"] == "simd"
@@ -61,3 +75,32 @@ def test_host_uva_dispatch(device_type, tokens, width, dtype, monkeypatch):
             assert kwargs["BLOCK_ROWS"] == (4 if tokens <= 4 else 8 if tokens < 32 else 16)
     elif selected == 2:
         assert kwargs["compile_mode"] == "simt_only"
+    elif selected == 1:
+        assert kwargs["ROWS"] == tokens * 24
+        assert kwargs["ROWS_PER_PROGRAM"] == (tokens * 24 + expected_programs - 1) // expected_programs
+        owned_rows = [
+            program + slot * expected_programs
+            for program in range(expected_programs)
+            for slot in range(kwargs["ROWS_PER_PROGRAM"])
+            if program + slot * expected_programs < kwargs["ROWS"]
+        ]
+        assert sorted(owned_rows) == list(range(tokens * 24))
+
+
+@pytest.mark.parametrize("vectorcores,divisor,expected", [(48, 2, 24), (48, 4, 12), (1, 4, 1), (47, 4, 11)])
+def test_host_uva_program_limit(vectorcores, divisor, expected, monkeypatch):
+    initialized = []
+    monkeypatch.setattr(triton_utils, "init_device_properties_triton", lambda: initialized.append(True))
+
+    def detected_cores():
+        assert initialized
+        return vectorcores
+
+    monkeypatch.setattr(triton_utils, "get_vectorcore_num", detected_cores)
+    assert npu._get_uva_program_limit(divisor) == expected
+
+
+@pytest.mark.parametrize("divisor", [0, -1])
+def test_host_uva_program_limit_rejects_invalid_fraction(divisor):
+    with pytest.raises(ValueError, match="must be positive"):
+        npu._get_uva_program_limit(divisor)

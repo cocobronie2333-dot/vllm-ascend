@@ -5,6 +5,7 @@
 
 from contextlib import ExitStack
 from dataclasses import replace
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -31,6 +32,16 @@ def lookup_backend(request, monkeypatch):
         backend = EngramUvaBackend.TILED_SIMD if request.param == "simd_tiled" else EngramUvaBackend.SIMD
         profile = replace(npu.get_current_hardware_profile(), engram_uva_backend=backend)
         monkeypatch.setattr(npu, "get_current_hardware_profile", lambda: profile)
+
+
+@pytest.fixture(params=[2, 4], autouse=True)
+def program_fraction(request, monkeypatch):
+    monkeypatch.setattr(
+        npu,
+        "gather_dequantize_host_uva",
+        partial(npu.gather_dequantize_host_uva, vectorcore_divisor=request.param),
+    )
+    return request.param
 
 
 @pytest.mark.parametrize(
@@ -67,7 +78,7 @@ def lookup_backend(request, monkeypatch):
 @pytest.mark.parametrize("force_tiled", [False, True])
 @pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
 def test_host_uva_fp8_token_tiles_match_rowwise_lookup(
-    num_tokens, local_heads, width, force_tiled, ids_dtype, monkeypatch
+    num_tokens, local_heads, width, force_tiled, ids_dtype, monkeypatch, program_fraction
 ):
     # Cross pointer-table chunks without allocating a multi-gigabyte host table.
     monkeypatch.setattr(npu, "CHUNK_ROWS", 32)
@@ -132,7 +143,7 @@ def test_host_uva_fp8_token_tiles_match_rowwise_lookup(
         rows = num_tokens * local_heads
         if not rows:
             return
-        npu._engram_host_uva_gather_dequant_kernel[(min(rows, npu.UVA_MAX_PROGRAMS),)](
+        npu._engram_host_uva_gather_dequant_kernel[(min(rows, npu._get_uva_program_limit(program_fraction)),)](
             codes.ptrs,
             scales.ptrs,
             ids,
