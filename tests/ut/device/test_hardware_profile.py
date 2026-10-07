@@ -14,6 +14,7 @@ from vllm_ascend.device.hardware_profile import (
     CPUBindingMode,
     DeviceAdaptorFamily,
     DeviceAddressingMode,
+    EngramUvaBackend,
     HardwareCapability,
     MoECommPolicy,
     QuantizationBackendFamily,
@@ -58,6 +59,7 @@ _EXPECTED_CAPABILITIES = {
         HardwareCapability.MC2_FULLMESH_V2_COMM,
         HardwareCapability.MOE_DISPATCH_EXTRA_ARGS,
         HardwareCapability.NPU_TOP_K_TOP_P,
+        HardwareCapability.RMS_NORM_CAST,
     },
     AscendDeviceType._310P: frozenset(
         {
@@ -199,6 +201,18 @@ def test_hardware_profile_capability_matrix(device_type: AscendDeviceType) -> No
     assert profile.capabilities == expected_capabilities
     for capability in HardwareCapability:
         assert profile.supports(capability) is (capability in expected_capabilities)
+
+
+@pytest.mark.parametrize(
+    "device_type,backend",
+    [
+        (AscendDeviceType.A2, EngramUvaBackend.SIMD),
+        (AscendDeviceType.A3, EngramUvaBackend.SIMD),
+        (AscendDeviceType.A5, EngramUvaBackend.NATIVE_FP8_SIMT),
+    ],
+)
+def test_engram_uva_backend(device_type, backend):
+    assert get_hardware_profile(device_type).engram_uva_backend is backend
 
 
 def test_current_hardware_profile_uses_device_config() -> None:

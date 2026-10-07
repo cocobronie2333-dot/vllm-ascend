@@ -183,6 +183,15 @@ class DeviceAddressingMode(Enum):
     DUAL_CHIP_CARD = auto()
 
 
+class EngramUvaBackend(Enum):
+    """HOST_UVA lookup implementations, including FP8 conversion policy."""
+
+    # Portable vector lookup; decode FP8 bytes without native FP8 casts.
+    SIMD = auto()
+    # Native vector FP8 for short lookups, packed SIMT for larger lookups.
+    NATIVE_FP8_SIMT = auto()
+
+
 class MoECommPolicy(Enum):
     """MoE communication selection policies."""
 
@@ -228,6 +237,7 @@ class HardwareProfile:
     quantization_backend_family: QuantizationBackendFamily
     # Independent, additive contracts queried with ``supports``.
     capabilities: frozenset[HardwareCapability]
+    engram_uva_backend: EngramUvaBackend = EngramUvaBackend.SIMD
 
     def supports(self, capability: HardwareCapability) -> bool:
         """Return whether the exact documented ``capability`` contract is available."""
@@ -323,6 +333,7 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
         ),
         AscendDeviceType.A5: HardwareProfile(
             _device_type=AscendDeviceType.A5,
+            engram_uva_backend=EngramUvaBackend.NATIVE_FP8_SIMT,
             attention_backend_family=AttentionBackendFamily.STANDARD,
             cpu_binding_mode=CPUBindingMode.TOPO_AFFINITY,
             default_worker_cls=_DEFAULT_WORKER_CLS,
