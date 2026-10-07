@@ -5,6 +5,7 @@
 
 from contextlib import ExitStack
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -22,12 +23,13 @@ def initialize_npu():
     torch.npu.set_device(0)
 
 
-@pytest.fixture(params=["device", "simd"], autouse=True)
+@pytest.fixture(params=["device", "simd", "simd_tiled"], autouse=True)
 def lookup_backend(request, monkeypatch):
     # On 950 also exercise the portable software-FP8 path. This verifies its
     # numerics, not A3 hardware performance or A3 compiler code generation.
-    if request.param == "simd":
-        profile = replace(npu.get_current_hardware_profile(), engram_uva_backend=EngramUvaBackend.SIMD)
+    if request.param != "device":
+        backend = EngramUvaBackend.TILED_SIMD if request.param == "simd_tiled" else EngramUvaBackend.SIMD
+        profile = replace(npu.get_current_hardware_profile(), engram_uva_backend=backend)
         monkeypatch.setattr(npu, "get_current_hardware_profile", lambda: profile)
 
 
@@ -36,6 +38,8 @@ def lookup_backend(request, monkeypatch):
     [
         (0, 24),
         (1, 24),
+        (2, 24),
+        (4, 24),
         (5, 24),
         (6, 24),
         (7, 24),
@@ -43,10 +47,14 @@ def lookup_backend(request, monkeypatch):
         (9, 24),
         (10, 24),
         (17, 24),
+        (31, 24),
+        (32, 24),
+        (33, 24),
         (127, 24),
         (128, 24),
         (129, 24),
         (384, 24),
+        (1024, 24),
         (9, 3),
         (128, 3),
         (384, 3),
@@ -57,7 +65,10 @@ def lookup_backend(request, monkeypatch):
 )
 @pytest.mark.parametrize("width", [256])
 @pytest.mark.parametrize("force_tiled", [False, True])
-def test_host_uva_fp8_token_tiles_match_rowwise_lookup(num_tokens, local_heads, width, force_tiled, monkeypatch):
+@pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
+def test_host_uva_fp8_token_tiles_match_rowwise_lookup(
+    num_tokens, local_heads, width, force_tiled, ids_dtype, monkeypatch
+):
     # Cross pointer-table chunks without allocating a multi-gigabyte host table.
     monkeypatch.setattr(npu, "CHUNK_ROWS", 32)
     # Cover both the normal dispatch (including short unrolled lookups) and
@@ -65,6 +76,7 @@ def test_host_uva_fp8_token_tiles_match_rowwise_lookup(num_tokens, local_heads, 
     if force_tiled:
         monkeypatch.setattr(npu, "UVA_FP8_MIN_TILES_PER_PROGRAM", 0)
         monkeypatch.setattr(npu, "UVA_FP8_ROW_TILE_MIN_TOKENS", 0)
+        monkeypatch.setattr(npu, "UVA_FP8_SIMD_MIN_TOKENS", 0)
     table_rows = 64
     vocab_start = 11
     head_start = 2
@@ -83,13 +95,13 @@ def test_host_uva_fp8_token_tiles_match_rowwise_lookup(num_tokens, local_heads, 
         codes.tensor.copy_(codes_data)
         scales.tensor.copy_(scale_data)
 
-        ids_data = torch.arange(num_tokens * (local_heads + head_start), dtype=torch.int32)
+        ids_data = torch.arange(num_tokens * (local_heads + head_start), dtype=ids_dtype)
         ids_data = (ids_data % table_rows + vocab_start).reshape(num_tokens, local_heads + head_start)
         if num_tokens:
             ids_data[0, head_start] = -1
             ids_data[-1, head_start + local_heads - 1] = vocab_start + table_rows
         # Preserve contiguous heads but exercise a non-contiguous token stride.
-        ids = torch.empty((num_tokens * 2, local_heads + head_start), dtype=torch.int32, device=device)[::2]
+        ids = torch.empty((num_tokens * 2, local_heads + head_start), dtype=ids_dtype, device=device)[::2]
         ids.copy_(ids_data)
         output_shape = (num_tokens * pad_heads, width)
         tiled = torch.full(output_shape, -3, dtype=torch.bfloat16, device=device)
@@ -144,7 +156,7 @@ def test_host_uva_fp8_token_tiles_match_rowwise_lookup(num_tokens, local_heads, 
 
 
 @pytest.mark.parametrize("width", [256])
-@pytest.mark.parametrize("num_tokens", [1, 128])
+@pytest.mark.parametrize("num_tokens", [1, 8, 9, 128])
 def test_host_uva_fp8_all_encodings(width, num_tokens):
     """Exercise FP8 subnormals/NaNs and E8M0 underflow/overflow on the NPU."""
     local_heads = 24
@@ -203,3 +215,37 @@ def test_host_uva_vector_storage(dtype, num_tokens, monkeypatch):
         expected[~owned] = 0
         result = npu.gather_dequantize_host_uva(codes, scales, ids_cpu.to(device), local_heads=local_heads)
         torch.testing.assert_close(result.cpu(), expected.reshape(-1, width), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 8, 128])
+def test_host_uva_fp8_disjoint_chunks(num_tokens, monkeypatch):
+    """SIMD tile offsets must support separate allocations and negative deltas."""
+    chunk_rows, chunks, width, local_heads = 32, 3, 256, 24
+    monkeypatch.setattr(npu, "CHUNK_ROWS", chunk_rows)
+    device = torch.device("npu:0")
+    with ExitStack() as stack:
+        code_chunks, scale_chunks = [], []
+        for index in range(chunks):
+            codes = npu.HostUvaBuffer((chunk_rows, width), torch.float8_e4m3fn, device)
+            stack.callback(codes.close)
+            scales = npu.HostUvaBuffer((chunk_rows, width // npu.SCALE_GROUP), torch.uint8, device)
+            stack.callback(scales.close)
+            codes.tensor.fill_(index + 1)
+            scales.tensor.fill_(127 + index)
+            code_chunks.append(codes)
+            scale_chunks.append(scales)
+        # CPU synchronization is outside the operator: deliberately make the
+        # scalar origin the largest address so later chunks have negative offsets.
+        code_chunks.sort(key=lambda chunk: int(chunk.ptrs.cpu()[0]), reverse=True)
+        scale_chunks.sort(key=lambda chunk: int(chunk.ptrs.cpu()[0]), reverse=True)
+        code_data = torch.cat([chunk.tensor for chunk in code_chunks])
+        scale_data = torch.cat([chunk.tensor for chunk in scale_chunks])
+        codes = SimpleNamespace(tensor=code_data, ptrs=torch.cat([chunk.ptrs for chunk in code_chunks]))
+        scales = SimpleNamespace(ptrs=torch.cat([chunk.ptrs for chunk in scale_chunks]))
+        ids_cpu = torch.arange(num_tokens * local_heads, dtype=torch.int64).reshape(num_tokens, local_heads)
+        ids_cpu = (ids_cpu * chunk_rows + ids_cpu // chunks) % (chunks * chunk_rows)
+        scale = torch.ldexp(torch.ones_like(scale_data, dtype=torch.float32), scale_data.int() - 127)
+        decoded = (code_data.float().unflatten(-1, (-1, npu.SCALE_GROUP)) * scale[..., None]).flatten(-2)
+        expected = decoded[ids_cpu].reshape(-1, width).bfloat16()
+        result = npu.gather_dequantize_host_uva(codes, scales, ids_cpu.to(device), local_heads=local_heads)
+        torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)

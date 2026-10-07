@@ -188,6 +188,8 @@ class EngramUvaBackend(Enum):
 
     # Portable vector lookup; decode FP8 bytes without native FP8 casts.
     SIMD = auto()
+    # A3 vector lookup with bounded multi-row FP8 tiles.
+    TILED_SIMD = auto()
     # Native vector FP8 for short lookups, packed SIMT for larger lookups.
     NATIVE_FP8_SIMT = auto()
 
@@ -293,6 +295,7 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
         ),
         AscendDeviceType.A3: HardwareProfile(
             _device_type=AscendDeviceType.A3,
+            engram_uva_backend=EngramUvaBackend.TILED_SIMD,
             attention_backend_family=AttentionBackendFamily.STANDARD,
             cpu_binding_mode=CPUBindingMode.GLOBAL_SLICE,
             default_worker_cls=_DEFAULT_WORKER_CLS,

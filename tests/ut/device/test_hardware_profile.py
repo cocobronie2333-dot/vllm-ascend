@@ -207,7 +207,7 @@ def test_hardware_profile_capability_matrix(device_type: AscendDeviceType) -> No
     "device_type,backend",
     [
         (AscendDeviceType.A2, EngramUvaBackend.SIMD),
-        (AscendDeviceType.A3, EngramUvaBackend.SIMD),
+        (AscendDeviceType.A3, EngramUvaBackend.TILED_SIMD),
         (AscendDeviceType.A5, EngramUvaBackend.NATIVE_FP8_SIMT),
     ],
 )
