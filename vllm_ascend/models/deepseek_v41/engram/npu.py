@@ -543,6 +543,246 @@ def _get_uva_program_limit(vectorcore_divisor: int = UVA_VECTORCORE_DIVISOR) -> 
     return max(1, get_vectorcore_num() // vectorcore_divisor)
 
 
+def _select_a3_simd_tile_size(tokens: int) -> int:
+    """A3 SIMD：短查询用小 tile，长查询用 16 行 tile 摊销固定开销。"""
+    if tokens < UVA_FP8_SIMD_MEDIUM_TILE_MIN_TOKENS:
+        return UVA_FP8_SIMD_SMALL_TILE_SIZE
+    if tokens < UVA_FP8_SIMD_LARGE_TILE_MIN_TOKENS:
+        return UVA_FP8_SIMD_MEDIUM_TILE_SIZE
+    return UVA_FP8_ROW_TILE_SIZE
+
+
+def _launch_a3_tiled_simd(
+    codes: HostUvaBuffer,
+    scales: HostUvaBuffer,
+    ids: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    tokens: int,
+    width: int,
+    max_programs: int,
+    head_start: int,
+    local_heads: int,
+    pad_heads: int,
+    vocab_start: int,
+    vocab_end: int,
+) -> bool:
+    """A3 的 (24, 256) FP8 SIMD tile 路径。已启动返回 True。"""
+    if (local_heads, width) != UVA_FP8_ROW_TILE_SHAPE:
+        return False
+    if tokens < UVA_FP8_SIMD_MIN_TOKENS:
+        return False
+    block_rows = _select_a3_simd_tile_size(tokens)
+    _engram_host_uva_gather_dequant_fp8_simd_kernel[(max_programs,)](
+        codes.ptrs,
+        scales.ptrs,
+        ids,
+        output,
+        tokens,
+        vocab_start,
+        vocab_end,
+        ids.stride(0),
+        CHUNK=CHUNK_ROWS,
+        WIDTH=width,
+        GROUP=SCALE_GROUP,
+        HEAD_START=head_start,
+        LOCAL_HEADS=local_heads,
+        PAD_HEADS=pad_heads,
+        BLOCK_ROWS=block_rows,
+        num_warps=4,
+        compile_mode="simd",
+    )
+    return True
+
+
+def _launch_a5_small_row(
+    codes: HostUvaBuffer,
+    scales: HostUvaBuffer,
+    ids: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    tokens: int,
+    width: int,
+    rows: int,
+    max_programs: int,
+    head_start: int,
+    local_heads: int,
+    pad_heads: int,
+    vocab_start: int,
+    vocab_end: int,
+) -> None:
+    """A5 短批专用：逐行静态展开，适合 tokens < 9。"""
+    num_programs = min(rows, max_programs)
+    _engram_host_uva_gather_dequant_fp8_small_kernel[(num_programs,)](
+        codes.ptrs,
+        scales.ptrs,
+        ids,
+        output,
+        vocab_start,
+        vocab_end,
+        ids.stride(0),
+        CHUNK=CHUNK_ROWS,
+        WIDTH=width,
+        GROUP=SCALE_GROUP,
+        HEAD_START=head_start,
+        LOCAL_HEADS=local_heads,
+        PAD_HEADS=pad_heads,
+        ROWS=rows,
+        ROWS_PER_PROGRAM=triton.cdiv(rows, num_programs),
+        num_warps=4,
+    )
+
+
+def _launch_a5_token_tiled(
+    codes: HostUvaBuffer,
+    scales: HostUvaBuffer,
+    ids: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    tokens: int,
+    width: int,
+    max_programs: int,
+    head_start: int,
+    local_heads: int,
+    pad_heads: int,
+    vocab_start: int,
+    vocab_end: int,
+    tile_tokens: int,
+    block_rows: int,
+    row_tiled: bool,
+    num_tiles: int,
+) -> None:
+    """A5 的 4 字节 word 打包 SIMT token kernel。"""
+    _engram_host_uva_gather_dequant_fp8_token_kernel[(min(num_tiles, max_programs),)](
+        codes.ptrs,
+        scales.ptrs,
+        ids,
+        output,
+        tokens,
+        vocab_start,
+        vocab_end,
+        ids.stride(0),
+        CHUNK=CHUNK_ROWS,
+        WIDTH=width,
+        GROUP=SCALE_GROUP,
+        HEAD_START=head_start,
+        LOCAL_HEADS=local_heads,
+        PAD_HEADS=pad_heads,
+        TILE_TOKENS=tile_tokens,
+        BLOCK_ROWS=block_rows,
+        WORD_BYTES=UVA_FP8_WORD_BYTES,
+        ROW_TILED=row_tiled,
+        num_warps=UVA_FP8_SIMT_WARPS,
+        compile_mode="simt_only",
+    )
+
+
+def _launch_a5_native_fp8_simt(
+    codes: HostUvaBuffer,
+    scales: HostUvaBuffer,
+    ids: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    tokens: int,
+    width: int,
+    rows: int,
+    max_programs: int,
+    head_start: int,
+    local_heads: int,
+    pad_heads: int,
+    vocab_start: int,
+    vocab_end: int,
+) -> bool:
+    """A5 的 NATIVE_FP8_SIMT 路径。已启动返回 True，否则调用方回退。"""
+    tile_tokens = triton.cdiv(UVA_FP8_ROWS_PER_TILE, local_heads)
+    row_tiled = (local_heads, width) == UVA_FP8_ROW_TILE_SHAPE
+
+    if row_tiled:
+        # 短批：逐行 small kernel，不走 16 行 tile。
+        if tokens < UVA_FP8_ROW_TILE_MIN_TOKENS:
+            _launch_a5_small_row(
+                codes, scales, ids, output,
+                tokens=tokens, width=width, rows=rows,
+                max_programs=max_programs,
+                head_start=head_start, local_heads=local_heads,
+                pad_heads=pad_heads,
+                vocab_start=vocab_start, vocab_end=vocab_end,
+            )
+            return True
+        # 长批：16 行 row tile，前面已保证 tokens >= 9，use_tiled 恒为 True。
+        block_rows = UVA_FP8_ROW_TILE_SIZE
+        num_tiles = triton.cdiv(rows, block_rows)
+        use_tiled = True
+    else:
+        block_rows = triton.next_power_of_2(tile_tokens * local_heads)
+        num_tiles = triton.cdiv(tokens, tile_tokens)
+        use_tiled = num_tiles >= max_programs * UVA_FP8_MIN_TILES_PER_PROGRAM
+
+    if block_rows > UVA_FP8_MAX_BLOCK_ROWS or not use_tiled:
+        return False
+
+    _launch_a5_token_tiled(
+        codes, scales, ids, output,
+        tokens=tokens, width=width, max_programs=max_programs,
+        head_start=head_start, local_heads=local_heads, pad_heads=pad_heads,
+        vocab_start=vocab_start, vocab_end=vocab_end,
+        tile_tokens=tile_tokens, block_rows=block_rows,
+        row_tiled=row_tiled, num_tiles=num_tiles,
+    )
+    return True
+
+
+def _launch_generic_uva(
+    codes: HostUvaBuffer,
+    scales: HostUvaBuffer | None,
+    ids: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    tokens: int,
+    width: int,
+    rows: int,
+    max_programs: int,
+    head_start: int,
+    local_heads: int,
+    pad_heads: int,
+    vocab_start: int,
+    vocab_end: int,
+    native_fp8: bool,
+) -> None:
+    """通用行循环 kernel：BF16 / INT8 / MXFP8 / 原生 FP8 都走这里。"""
+    num_programs = min(rows, max_programs)
+    _engram_host_uva_gather_dequant_kernel[(num_programs,)](
+        codes.ptrs,
+        scales.ptrs if scales is not None else None,
+        ids,
+        output,
+        rows,
+        vocab_start,
+        vocab_end,
+        ids.stride(0),
+        CHUNK=CHUNK_ROWS,
+        WIDTH=width,
+        GROUP=SCALE_GROUP,
+        HEAD_START=head_start,
+        LOCAL_HEADS=local_heads,
+        PAD_HEADS=pad_heads,
+        QUANTIZED=scales is not None,
+        MXFP8=codes.tensor.dtype == torch.float8_e4m3fn,
+        NATIVE_FP8=native_fp8,
+        num_warps=4,
+        compile_mode="simd_simt_template" if native_fp8 else "simd",
+    )
+
+def _is_tiled_fp8(codes: HostUvaBuffer, scales: HostUvaBuffer | None,
+                  width: int, output: torch.Tensor) -> bool:
+    return (
+        codes.tensor.dtype == torch.float8_e4m3fn
+        and scales is not None
+        and width in UVA_FP8_TILED_WIDTHS
+        and output.dtype == torch.bfloat16
+        and output.data_ptr() % UVA_FP8_WORD_BYTES == 0
+    )
+
 def gather_dequantize_host_uva(
     codes: HostUvaBuffer,
     scales: HostUvaBuffer | None,
@@ -572,135 +812,41 @@ def gather_dequantize_host_uva(
         output = torch.empty((tokens * pad_heads, width), dtype=torch.bfloat16, device=ids.device)
     if rows == 0:
         return output
+
     max_programs = _get_uva_program_limit(vectorcore_divisor)
     backend = get_current_hardware_profile().engram_uva_backend
     native_fp8 = backend == EngramUvaBackend.NATIVE_FP8_SIMT
-    tiled_fp8 = (
-        codes.tensor.dtype == torch.float8_e4m3fn
-        and scales is not None
-        and width in UVA_FP8_TILED_WIDTHS
-        and output.dtype == torch.bfloat16
-        and output.data_ptr() % UVA_FP8_WORD_BYTES == 0
-    )
-    if (
-        tiled_fp8
-        and backend == EngramUvaBackend.TILED_SIMD
-        and (local_heads, width) == UVA_FP8_ROW_TILE_SHAPE
-        and tokens >= UVA_FP8_SIMD_MIN_TOKENS
-    ):
-        # Small batches need narrower tiles to use the bounded grid without
-        # paying for mostly masked rows. Larger batches amortize 16-row tiles.
-        if tokens < UVA_FP8_SIMD_MEDIUM_TILE_MIN_TOKENS:
-            block_rows = UVA_FP8_SIMD_SMALL_TILE_SIZE
-        elif tokens < UVA_FP8_SIMD_LARGE_TILE_MIN_TOKENS:
-            block_rows = UVA_FP8_SIMD_MEDIUM_TILE_SIZE
-        else:
-            block_rows = UVA_FP8_ROW_TILE_SIZE
-        _engram_host_uva_gather_dequant_fp8_simd_kernel[(max_programs,)](
-            codes.ptrs,
-            scales.ptrs,
-            ids,
-            output,
-            tokens,
-            vocab_start,
-            vocab_end,
-            ids.stride(0),
-            CHUNK=CHUNK_ROWS,
-            WIDTH=width,
-            GROUP=SCALE_GROUP,
-            HEAD_START=head_start,
-            LOCAL_HEADS=local_heads,
-            PAD_HEADS=pad_heads,
-            BLOCK_ROWS=block_rows,
-            num_warps=4,
-            compile_mode="simd",
-        )
-        return output
-    if tiled_fp8 and backend == EngramUvaBackend.NATIVE_FP8_SIMT:
-        tile_tokens = triton.cdiv(UVA_FP8_ROWS_PER_TILE, local_heads)
-        row_tiled = (local_heads, width) == UVA_FP8_ROW_TILE_SHAPE
-        if row_tiled:
-            if tokens < UVA_FP8_ROW_TILE_MIN_TOKENS:
-                num_programs = min(rows, max_programs)
-                _engram_host_uva_gather_dequant_fp8_small_kernel[(num_programs,)](
-                    codes.ptrs,
-                    scales.ptrs,
-                    ids,
-                    output,
-                    vocab_start,
-                    vocab_end,
-                    ids.stride(0),
-                    CHUNK=CHUNK_ROWS,
-                    WIDTH=width,
-                    GROUP=SCALE_GROUP,
-                    HEAD_START=head_start,
-                    LOCAL_HEADS=local_heads,
-                    PAD_HEADS=pad_heads,
-                    ROWS=rows,
-                    ROWS_PER_PROGRAM=triton.cdiv(rows, num_programs),
-                    num_warps=4,
-                )
-                return output
-            block_rows = UVA_FP8_ROW_TILE_SIZE
-            num_tiles = triton.cdiv(rows, block_rows)
-            use_tiled = tokens >= UVA_FP8_ROW_TILE_MIN_TOKENS
-        else:
-            block_rows = triton.next_power_of_2(tile_tokens * local_heads)
-            num_tiles = triton.cdiv(tokens, tile_tokens)
-            use_tiled = num_tiles >= max_programs * UVA_FP8_MIN_TILES_PER_PROGRAM
-        if block_rows <= UVA_FP8_MAX_BLOCK_ROWS and use_tiled:
-            _engram_host_uva_gather_dequant_fp8_token_kernel[(min(num_tiles, max_programs),)](
-                codes.ptrs,
-                scales.ptrs,
-                ids,
-                output,
-                tokens,
-                vocab_start,
-                vocab_end,
-                ids.stride(0),
-                CHUNK=CHUNK_ROWS,
-                WIDTH=width,
-                GROUP=SCALE_GROUP,
-                HEAD_START=head_start,
-                LOCAL_HEADS=local_heads,
-                PAD_HEADS=pad_heads,
-                TILE_TOKENS=tile_tokens,
-                BLOCK_ROWS=block_rows,
-                WORD_BYTES=UVA_FP8_WORD_BYTES,
-                ROW_TILED=row_tiled,
-                num_warps=UVA_FP8_SIMT_WARPS,
-                compile_mode="simt_only",
-            )
+    tiled_fp8 = _is_tiled_fp8(codes, scales, width, output)
+
+    if tiled_fp8 and backend == EngramUvaBackend.TILED_SIMD:
+        if _launch_a3_tiled_simd(
+            codes, scales, ids, output,
+            tokens=tokens, width=width, max_programs=max_programs,
+            head_start=head_start, local_heads=local_heads,
+            pad_heads=pad_heads,
+            vocab_start=vocab_start, vocab_end=vocab_end,
+        ):
             return output
-    # Launch a bounded grid. Programs stride over rows at runtime so changing
-    # the request size does not require a new row-count specialization.
-    # A3 uses SIMD for both INT8/FP32 model storage and byte-decoded FP8 inputs,
-    # without requiring native FP8 conversion or a SIMT compilation backend.
-    num_programs = min(rows, max_programs)
-    # The kernel widens loaded IDs to int64; no extra cast/copy is needed here.
-    _engram_host_uva_gather_dequant_kernel[(num_programs,)](
-        codes.ptrs,
-        scales.ptrs if scales is not None else None,
-        ids,
-        output,
-        rows,
-        vocab_start,
-        vocab_end,
-        ids.stride(0),
-        CHUNK=CHUNK_ROWS,
-        WIDTH=width,
-        GROUP=SCALE_GROUP,
-        HEAD_START=head_start,
-        LOCAL_HEADS=local_heads,
-        PAD_HEADS=pad_heads,
-        QUANTIZED=scales is not None,
-        MXFP8=codes.tensor.dtype == torch.float8_e4m3fn,
-        NATIVE_FP8=native_fp8,
-        num_warps=4,
-        compile_mode="simd_simt_template" if native_fp8 else "simd",
+
+    if tiled_fp8 and backend == EngramUvaBackend.NATIVE_FP8_SIMT:
+        if _launch_a5_native_fp8_simt(
+            codes, scales, ids, output,
+            tokens=tokens, width=width, rows=rows, max_programs=max_programs,
+            head_start=head_start, local_heads=local_heads,
+            pad_heads=pad_heads,
+            vocab_start=vocab_start, vocab_end=vocab_end,
+        ):
+            return output
+
+    _launch_generic_uva(
+        codes, scales, ids, output,
+        tokens=tokens, width=width, rows=rows, max_programs=max_programs,
+        head_start=head_start, local_heads=local_heads,
+        pad_heads=pad_heads,
+        vocab_start=vocab_start, vocab_end=vocab_end,
+        native_fp8=native_fp8,
     )
     return output
-
 
 @triton.jit
 def _engram_host_uva_gather_dequant_hbm_scale_kernel(

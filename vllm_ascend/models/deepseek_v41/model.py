@@ -1122,7 +1122,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         slot_mapping=None,
         block_table=None,
         output_buffers=None,
-        defer_layer_id=None,
+        defer_lookups=False,
         return_pending=False,
         ready_events=None,
         output_tokens=None,
@@ -1195,9 +1195,9 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             gathered = gather_engram_hashes(hashes, dp_shared_memory=self.engram_dp_shared_memory)
             for slot, (layer_id, table) in enumerate(zip(config.engram_layer_ids, tables)):
                 direct = output_buffers is not None and self.engram_dp_shared_memory and table.tp_size == 1
-                if defer_layer_id is not None:
+                if defer_lookups:
                     if output_buffers is None:
-                        raise ValueError("defer_layer_id requires output_buffers")
+                        raise ValueError("defer_lookups requires output_buffers")
                     target = output_buffers[layer_id]
                     target[hashes.shape[0] : output_tokens].zero_()
                     pending[layer_id] = table.embed_gathered_async(
@@ -1280,7 +1280,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         buffers = graph_inputs["engram_lookups"]
         num_tokens = positions.shape[0]
         output_tokens = num_tokens if padded_tokens is None else padded_tokens
-        defer_layer_id = self.config.engram_layer_ids[-1] if self._can_defer_engram_lookup() else None
+        defer_lookups = self._can_defer_engram_lookup()
         try:
             lookups, mask, pending = self.prepare_engram(
                 input_ids,
@@ -1290,7 +1290,7 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                 slot_mapping,
                 block_table,
                 output_buffers=buffers,
-                defer_layer_id=defer_layer_id,
+                defer_lookups=defer_lookups,
                 return_pending=True,
                 ready_events=graph_inputs.get("engram_pending"),
                 output_tokens=output_tokens,
