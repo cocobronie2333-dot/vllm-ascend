@@ -3,24 +3,41 @@
 
 from collections.abc import Callable
 from contextlib import AbstractContextManager
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import torch
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import get_tp_group, tensor_model_parallel_all_gather
 from vllm.logger import logger
-from vllm.models.deepseek_v41.decoder_replay_layers import DecoderReplayLayers
 
 from vllm_ascend.utils import enable_dsa_cp
+
+from .upstream_decoder_replay_layers import DecoderReplayLayers
 
 if TYPE_CHECKING:
     from .model import DeepseekV41Model
 
 
 class AscendDecoderReplayLayers(DecoderReplayLayers):
-    context_factory: Callable[[], AbstractContextManager[None]] | None = None
-    num_actual_rows: int = 0
-    sequence_parallel: bool = False
+    """Adapt the upstream replay layer interface to Ascend MRV1 rows."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        window: int,
+        run_layers: Callable[..., tuple[torch.Tensor, ...]],
+        row_buffers: list[torch.Tensor | None],
+    ) -> None:
+        source_attn = SimpleNamespace(
+            topk_indices_buffer=row_buffers[0],
+            candidate_block_buffer=row_buffers[1],
+        )
+        super().__init__(vllm_config, window, source_attn, run_layers)
+        self.rows: torch.Tensor | None = None
+        self.context_factory: Callable[[], AbstractContextManager[None]] | None = None
+        self.num_actual_rows = 0
+        self.sequence_parallel = False
 
     def __call__(self, *states: torch.Tensor | None) -> tuple[torch.Tensor, ...]:
         if self.rows is None:
@@ -85,8 +102,6 @@ def make_decoder_replay(model: "DeepseekV41Model", config: VllmConfig) -> Ascend
         return None
     if config.use_v2_model_runner:
         reason = "the Ascend replay adapter currently uses the MRV1 preparation hook"
-    elif config.cache_config.enable_prefix_caching:
-        reason = "MRV1 encoder-side prefix replay is required when prefix caching is enabled"
     elif (
         (model.use_sequence_parallel and not enable_dsa_cp())
         or parallel.pipeline_parallel_size > 1
@@ -121,6 +136,7 @@ def make_decoder_replay(model: "DeepseekV41Model", config: VllmConfig) -> Ascend
             model.config.sliding_window,
         )
         replay = AscendDecoderReplayLayers(
+            config,
             model.config.sliding_window,
             model._run_replay_layers,
             [model.topk_indices_buffer, model.candidate_indices_buffer],

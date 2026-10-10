@@ -1632,8 +1632,8 @@ def test_dspark_v41_noncausal_metadata_preserves_full_visible_block(runtime, mon
 # A replayed request recomputes the hit's last window, so the sliding-window
 # group holds no KV of its own below ``replay_start``: those blocks were retired
 # and replaced by the null block, whose KV upstream documents as all-zero. The
-# window therefore has to be floored there, through ``ori_topk_length``, since
-# the operator bounds a window with one scalar for the whole call.
+# A3 rebases its block table and sequence lengths to ``replay_start``. The
+# operator's causal band then floors at the new zero without sparse indices.
 
 
 REPLAY_WINDOW = 32  # upstream's own SWA geometry
@@ -1685,8 +1685,23 @@ def _expected_lens(window: int, replay_start: int, positions) -> list[int]:
     return [p - max(p - window + 1, replay_start, 0) + 1 for p in positions]
 
 
-def _built_lens(metadata) -> list[int]:
-    return metadata.ori_topk_length[:, 0].tolist()
+def _rebased_band_lens(metadata) -> list[int]:
+    query_lens = (metadata.query_start_loc[1:] - metadata.query_start_loc[:-1]).tolist()
+    return [
+        min(metadata.ori_win_left + 1, position + 1)
+        for seq_len, query_len in zip(metadata.replay_seq_lens.tolist(), query_lens)
+        for position in range(seq_len - query_len, seq_len)
+    ]
+
+
+def _build_replayed_swa(builder, common):
+    return builder.build(
+        0,
+        common,
+        replay_start=common.replay_start,
+        replay_seq_lens=common.seq_lens,
+        replay_max_seq_len=int((common.seq_lens - common.replay_start).max()),
+    )
 
 
 def test_a_replayed_window_is_floored_at_the_replay_start(runtime):
@@ -1696,22 +1711,24 @@ def test_a_replayed_window_is_floored_at_the_replay_start(runtime):
     query_len = REPLAY_SEQ_LEN - REPLAY_START
     common = _replay_common([REPLAY_START], query_lens=[query_len], seq_lens=[REPLAY_SEQ_LEN])
 
-    metadata = builder.build(0, common)
+    metadata = _build_replayed_swa(builder, common)
 
     positions = range(REPLAY_START, REPLAY_SEQ_LEN)
-    assert _built_lens(metadata) == _expected_lens(REPLAY_WINDOW, REPLAY_START, positions)
+    assert _rebased_band_lens(metadata) == _expected_lens(REPLAY_WINDOW, REPLAY_START, positions)
     # The first replayed token sees itself and nothing else: the rest of the
     # window it would have asked for is below the replay start.
-    assert _built_lens(metadata)[0] == 1
+    assert _rebased_band_lens(metadata)[0] == 1
     # Rows stay floored while the query is inside the window it is rebuilding,
     # and are the full window once it has run past it.
-    assert _built_lens(metadata)[REPLAY_WINDOW - 1] == REPLAY_WINDOW
-    assert _built_lens(metadata)[REPLAY_WINDOW] == REPLAY_WINDOW
+    assert _rebased_band_lens(metadata)[REPLAY_WINDOW - 1] == REPLAY_WINDOW
+    assert _rebased_band_lens(metadata)[REPLAY_WINDOW] == REPLAY_WINDOW
     # The band is still what bounds the window from above, and nothing else
     # about the call changed.
     assert metadata.ori_mask_mode == 4
     assert metadata.ori_win_left == REPLAY_WINDOW - 1
     assert metadata.ori_sparse_indices is None
+    assert metadata.ori_topk_length is None
+    assert metadata.replay_seq_lens.tolist() == [REPLAY_SEQ_LEN - REPLAY_START]
 
 
 def test_a_window_that_drifts_between_the_spec_and_the_config_is_rejected(runtime):
@@ -1729,8 +1746,7 @@ def test_a_window_that_drifts_between_the_spec_and_the_config_is_rejected(runtim
 
 def test_only_the_request_that_replays_is_floored(runtime):
     """A replay step is one step of a batch: the requests that are not replaying
-    have a lower bound of zero, and their count is the one the operator's own
-    band would have produced."""
+    have a lower bound of zero, and the rebased band matches each window."""
     builder = _swa_builder(runtime)
     common = _replay_common(
         [REPLAY_START, 0],
@@ -1738,13 +1754,15 @@ def test_only_the_request_that_replays_is_floored(runtime):
         seq_lens=[REPLAY_SEQ_LEN, 20],
     )
 
-    metadata = builder.build(0, common)
+    metadata = _build_replayed_swa(builder, common)
 
-    lens = _built_lens(metadata)
+    lens = _rebased_band_lens(metadata)
     assert lens[: REPLAY_SEQ_LEN - REPLAY_START] == _expected_lens(
         REPLAY_WINDOW, REPLAY_START, range(REPLAY_START, REPLAY_SEQ_LEN)
     )
     assert lens[REPLAY_SEQ_LEN - REPLAY_START :] == _expected_lens(REPLAY_WINDOW, 0, range(15, 20))
+    assert metadata.ori_sparse_indices is None
+    assert metadata.ori_topk_length is None
 
 
 @pytest.mark.parametrize("drop_field", [False, True])
@@ -1767,14 +1785,14 @@ def test_a_step_that_does_not_replay_reports_no_length(runtime, drop_field):
 def test_an_all_zero_replay_start_reproduces_the_band(runtime):
     """The builder cannot tell zeros from a real replay without reading a device
     tensor, and must not: the runner's ``None`` is the only "does not replay".
-    So an all-zero vector has to be *equivalent* to the band rather than skipped
-    -- which is what makes this a floor and nothing else."""
+    An all-zero vector must leave the band equivalent to the ordinary one."""
     builder = _swa_builder(runtime)
     common = _replay_common([0], query_lens=[6], seq_lens=[REPLAY_SEQ_LEN])
 
-    metadata = builder.build(0, common)
+    metadata = _build_replayed_swa(builder, common)
 
-    assert _built_lens(metadata) == _expected_lens(REPLAY_WINDOW, 0, range(REPLAY_SEQ_LEN - 6, REPLAY_SEQ_LEN))
+    assert _rebased_band_lens(metadata) == _expected_lens(REPLAY_WINDOW, 0, range(REPLAY_SEQ_LEN - 6, REPLAY_SEQ_LEN))
+    assert metadata.ori_topk_length is None
 
 
 def test_only_the_sliding_window_group_carries_the_length(runtime):
@@ -1846,6 +1864,32 @@ def test_a5_replay_indices_keep_recent_keys_and_stable_buffers():
     assert lengths.tolist() == [[1], [4], [4], [-7]]
     assert indices.data_ptr() == index_ptr
     assert lengths.data_ptr() == length_ptr
+
+
+def test_a5_replay_builder_clamps_explicit_window_indices(runtime):
+    builder = _swa_builder(runtime)
+    builder._uses_a5_packed_cache = True
+    builder._a5_causal_swa_indices = torch.empty((REPLAY_WINDOW, 1, REPLAY_WINDOW), dtype=torch.int32)
+    builder._a5_causal_swa_lengths = torch.empty((REPLAY_WINDOW, 1), dtype=torch.int32)
+
+    def build_window_indices(positions, window_size, *, indices_output, lengths_output):
+        columns = torch.arange(window_size)
+        start = (positions - window_size + 1).clamp_min(0)
+        indices_output.copy_(start[:, None, None] + columns)
+        lengths_output.fill_(window_size)
+        return indices_output, lengths_output
+
+    builder._device_backend = SimpleNamespace(build_window_indices=build_window_indices)
+    common = _replay_common(
+        [REPLAY_START],
+        query_lens=[REPLAY_WINDOW],
+        seq_lens=[REPLAY_START + REPLAY_WINDOW],
+    )
+
+    metadata = _build_replayed_swa(builder, common)
+
+    assert metadata.ori_sparse_indices[0, 0, 0].item() == REPLAY_START
+    assert metadata.ori_topk_length[:, 0].tolist() == list(range(1, REPLAY_WINDOW + 1))
 
 
 @pytest.mark.parametrize("visible", [0, 1, 4, 8])

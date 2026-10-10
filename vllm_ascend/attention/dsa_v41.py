@@ -1083,7 +1083,16 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
         if ori_topk_length is None and ori_sparse_indices is not None and noncausal:
             ori_topk_length = (ori_sparse_indices >= 0).sum(dim=-1, dtype=torch.int32)
         replay_start = getattr(common, "replay_start", None)
-        if replay_start is not None and cache_kind == "swa" and not noncausal:
+        # A3 uses the rebased SWA block table and lengths below. Its causal
+        # window clamps at the new zero; ori_topk_length requires explicit
+        # ori_sparse_indices and must remain unset on this path.
+        if (
+            replay_start is not None
+            and cache_kind == "swa"
+            and not noncausal
+            and self._uses_a5_packed_cache
+            and ori_sparse_indices is not None
+        ):
             replay_visible_lens = build_replay_swa_visible_lens(
                 window_size,
                 common.query_start_loc[: num_reqs + 1],
@@ -1091,10 +1100,7 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                 replay_start,
                 num_actual_tokens,
             )
-            if self._uses_a5_packed_cache and ori_sparse_indices is not None:
-                clamp_replay_swa_indices(positions, ori_sparse_indices, ori_topk_length, replay_visible_lens)
-            else:
-                ori_topk_length = replay_visible_lens
+            clamp_replay_swa_indices(positions, ori_sparse_indices, ori_topk_length, replay_visible_lens)
         ori_mask_mode = 0 if noncausal else 4
         ori_win_left = max(0, window_size - 1)
         ori_win_right = 0
