@@ -903,3 +903,14 @@ python tests/e2e/models/swa_bounded_replay_probe.py \
 验收需要同时确认 HTTP 请求成功、输出与对照一致，以及服务日志中实际出现
 `SWA bounded replay is active`。仅启动成功或配置字段为真不足以证明已执行 replay。
 跨 chunk 回归还应使用小于 SWA 窗口的调度预算。
+
+### 12.2 已验证范围
+
+2026-10-11 在 A5、vLLM 0.30.0、V2 runner、eager、TP1/DP4/EP4 配置下：
+
+- 兼容协议、缓存分配及 worker/attention 回归测试共 161 项通过。
+- 真权重 E2E 共 24 次请求成功，文本和结束原因与关闭 replay 的对照一致。
+  长前缀为 6618 tokens，4 个 DP rank 均记录了实际 SWA 窗口 replay。
+- 2480 个镜像 vLLM Python 文件及 6 个复用算子库的哈希均未变化。
+
+这些验证不覆盖 ACL Graph、KV connector、MTP 或其他并行配置。
