@@ -80,6 +80,15 @@ class AscendInputBatch(InputBatch):
     is_dummy: bool = False
 
     @classmethod
+    def prefill_decode_kwargs(cls, batch_req_state) -> dict:
+        """Pass optional batch fields only when the upstream API supports them."""
+        values = {
+            "prefill_runs_as_decode_np": getattr(batch_req_state, "prefill_runs_as_decode_np", None),
+            "decode_graph_eligible": getattr(batch_req_state, "decode_graph_eligible", not batch_req_state.has_prefill),
+        }
+        return {name: value for name, value in values.items() if name in cls.__dataclass_fields__}
+
+    @classmethod
     def make_dummy(
         cls,
         num_reqs: int,

@@ -32,12 +32,17 @@ from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu import cudagraph_utils
 from vllm.v1.worker.gpu.block_table import BlockTables
-from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor, ModelCudaGraphManager
 from vllm.v1.worker.gpu.input_batch import InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.ubatch_utils import UBatchRunner
 from vllm.v1.worker.utils import AttentionGroup
+
+try:
+    from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
+except ImportError:
+    # vLLM 0.30 uses the old name; callers here already require DCP > 1.
+    from vllm.v1.worker.gpu.cp_utils import maybe_prepare_dcp_local_seq_lens as prepare_dcp_local_seq_lens
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.compilation.acl_graph import (

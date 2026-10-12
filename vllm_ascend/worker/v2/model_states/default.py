@@ -18,7 +18,7 @@
 #
 
 from collections.abc import Callable, Collection
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING, Any
@@ -26,15 +26,18 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 import torch.distributed as dist
-from vllm.distributed import get_dp_group
+from vllm.config import set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed import get_dp_group
 from vllm.forward_context import get_forward_context, set_forward_context
+from vllm.logger import logger
 from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheConfig
 from vllm.v1.utils import CpuGpuBuffer
+from vllm.v1.worker.dp_utils import skip_dp_coordination
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
-from vllm.v1.worker.dp_utils import skip_dp_coordination
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ascend_config import get_ascend_config
@@ -44,9 +47,9 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     get_sparse_kv_offload_manager,
     update_sparse_kv_offload_metadata,
 )
+from vllm_ascend.utils import enable_dsa_cp, should_skip_allreduce_across_dp_group
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata, ring_state_update_skipped
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
-from vllm_ascend.utils import enable_dsa_cp, should_skip_allreduce_across_dp_group
 
 
 class ReplayAttnMetadata(ModelSpecificAttnMetadata):
@@ -189,12 +192,18 @@ class AscendModelState(DefaultModelState):
         ):
             return
         if not self._decoder_replay_builders:
-            self._initialize_decoder_replay_metadata(attn_groups, kv_cache_config)
-        if cudagraph_mode != CUDAGraphMode.NONE or getattr(input_batch, "is_dummy", False):
+            # vLLM 0.30 does not scope lazy attention-builder initialization.
+            with set_current_vllm_config(self.vllm_config):
+                self._initialize_decoder_replay_metadata(attn_groups, kv_cache_config)
+        is_dummy = getattr(input_batch, "is_dummy", False)
+        # Idle DP ranks must join the replay agreement and MoE collectives.
+        # Profiling/capture dummies still bypass replay; idle dummies already
+        # carry the scope that prevents compressor ring-state updates.
+        if cudagraph_mode != CUDAGraphMode.NONE or (is_dummy and not ring_state_update_skipped()):
             return
 
         common_by_group = self._decoder_replay_common_metadata
-        real_batch = input_batch.num_reqs > 0 and bool(common_by_group)
+        real_batch = not is_dummy and input_batch.num_reqs > 0 and bool(common_by_group)
         trims = False
         kept_lens = np.empty(0, dtype=np.int32)
         self._decoder_replay_num_actual_tokens = input_batch.num_tokens
@@ -209,6 +218,13 @@ class AscendModelState(DefaultModelState):
             prefills = input_batch.is_prefilling_np[:num_reqs]
             kept_lens = np.where(prefills & ~keep_rows, np.minimum(query_lens, layers.window), query_lens)
             trims = bool((kept_lens < query_lens).any())
+            if trims:
+                logger.debug(
+                    "Decoder bounded replay: query_lens=%s, kept_lens=%s, window=%d",
+                    query_lens,
+                    kept_lens,
+                    layers.window,
+                )
             self._decoder_replay_num_actual_tokens = int(kept_lens.sum())
             kept_offsets = self._decoder_replay_offsets.np[: num_reqs + 1]
             kept_offsets[0] = 0
@@ -218,9 +234,7 @@ class AscendModelState(DefaultModelState):
         self._decoder_replay_num_tokens = self._decoder_replay_num_actual_tokens
         if enable_dsa_cp():
             tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-            self._decoder_replay_num_tokens = (
-                (self._decoder_replay_num_tokens + tp_size - 1) // tp_size
-            ) * tp_size
+            self._decoder_replay_num_tokens = ((self._decoder_replay_num_tokens + tp_size - 1) // tp_size) * tp_size
         self._decoder_replay_counts = None
         self._decoder_replay_counts_device = None
         dp_size = self.vllm_config.parallel_config.data_parallel_size
@@ -242,6 +256,8 @@ class AscendModelState(DefaultModelState):
             num_tokens = input_batch.num_tokens_after_padding
             torch.arange(num_tokens, out=self._decoder_replay_rows[:num_tokens])
             self._decoder_replay_rows[num_tokens : self._decoder_replay_num_tokens].zero_()
+            # Idle ranks join the decoder MoE, but must not write live KV pages.
+            self._decoder_replay_slot_mappings[:, : self._decoder_replay_num_tokens].fill_(PAD_SLOT_ID)
             self._decoder_replay_metadata = self.attn_metadata
         layers.rows = self._decoder_replay_rows[: self._decoder_replay_num_tokens]
         layers.num_actual_rows = self._decoder_replay_num_actual_tokens
@@ -323,12 +339,20 @@ class AscendModelState(DefaultModelState):
             self._decoder_replay_metadata,
             self.vllm_config,
             num_tokens=self._decoder_replay_num_tokens,
-            num_tokens_across_dp=self._decoder_replay_counts_device,
+            num_tokens_across_dp=self._decoder_replay_counts,
             cudagraph_runtime_mode=CUDAGraphMode.NONE,
             slot_mapping=slot_mapping,
             is_padding=outer.is_padding,
         ):
-            yield
+            inner = get_forward_context()
+            # On the string layer-name API, MoE dispatch selects the next
+            # registered layer by this cursor. A sub-batch changes rows, not
+            # the model's layer order; starting at zero runs encoder experts.
+            inner.moe_layer_index = outer.moe_layer_index
+            try:
+                yield
+            finally:
+                outer.moe_layer_index = inner.moe_layer_index
 
     def remove_request(self, req_id: str) -> None:
         super().remove_request(req_id)

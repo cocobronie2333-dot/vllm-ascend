@@ -398,11 +398,18 @@ def _ascend_get_packed_kv_cache_groups(
             assert _orig_get_packed_kv_cache_groups is not None
             return _orig_get_packed_kv_cache_groups(vllm_config, kv_cache_spec)
         groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
-    vllm.v1.core.kv_cache_utils._annotate_eagle_groups(
+    cache_utils = vllm.v1.core.kv_cache_utils
+    uses_trailing_mtp = getattr(cache_utils, "_uses_trailing_mtp_layers", None)
+    if uses_trailing_mtp is not None:
+        annotation_kwargs = {"use_trailing_layer_fallback": uses_trailing_mtp(vllm_config)}
+    else:
+        # vLLM 0.30 names both the predicate and annotator keyword differently.
+        annotation_kwargs = {"use_deepseek_v4_fallback": cache_utils._is_deepseek_v4_eagle(vllm_config)}
+    cache_utils._annotate_eagle_groups(
         vllm_config,
         kv_cache_spec,
         groups,
-        use_trailing_layer_fallback=vllm.v1.core.kv_cache_utils._uses_trailing_mtp_layers(vllm_config),
+        **annotation_kwargs,
     )
     vllm.v1.core.kv_cache_utils._warn_if_unannotated_eagle_mamba(
         vllm_config,

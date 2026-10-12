@@ -132,6 +132,15 @@ def build_replay_swa_visible_lens(
     return (positions - start_positions + 1).to(torch.int32).unsqueeze(1)
 
 
+def build_decoder_replay_swa_indices(positions, window_size, query_start_loc, seq_lens, replay_start):
+    """Publish only keys written by the retained decoder query rows."""
+    lengths = build_replay_swa_visible_lens(window_size, query_start_loc, seq_lens, replay_start, positions.shape[0])
+    columns = torch.arange(window_size, device=positions.device)
+    starts = positions[:, None] + 1 - lengths
+    indices = torch.where(columns < lengths, starts + columns, -1).to(torch.int32).unsqueeze(1)
+    return indices, lengths
+
+
 @dataclass
 class AscendDSAV41Metadata(AttentionMetadata):
     """Scheduler and cache-plane contract for one V4.1 cache resource.
@@ -1158,6 +1167,16 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                     num_reqs * blocks_per_req, dtype=torch.int32, device=seq_lens.device
                 ).view(num_reqs, blocks_per_req)
         noncausal = not bool(getattr(common, "causal", True))
+        if replay_start is not None and self._uses_a5_packed_cache and cache_kind == "swa":
+            # Packed attention uses explicit logical indices. Decoder replay
+            # writes no SWA KV below this floor, so do not publish those keys.
+            ori_sparse_indices, ori_topk_length = build_decoder_replay_swa_indices(
+                positions[:num_actual_tokens],
+                window_size,
+                common.query_start_loc[: num_reqs + 1],
+                seq_lens,
+                replay_start,
+            )
         if noncausal and ori_sparse_indices is None:
             ori_sparse_indices, ori_topk_length = build_dspark_swa_indices(
                 common.block_table_tensor[:num_reqs],
