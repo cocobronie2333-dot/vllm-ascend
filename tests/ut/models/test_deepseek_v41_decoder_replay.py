@@ -13,7 +13,7 @@ from vllm_ascend.models.deepseek_v41.model import DeepseekV41Model
 
 
 @pytest.mark.parametrize("use_v2", [False, True])
-def test_decoder_replay_requires_mrv2_with_prefix_caching(use_v2):
+def test_decoder_replay_supports_both_runners_with_prefix_caching(use_v2):
     model = SimpleNamespace(
         config=SimpleNamespace(kv_source_layer_ids=[0], sliding_window=2, engram_layer_ids=[]),
         end_layer=3,
@@ -22,6 +22,8 @@ def test_decoder_replay_requires_mrv2_with_prefix_caching(use_v2):
         _run_replay_layers=lambda *states: states,
         topk_indices_buffer=torch.zeros(8, 2),
         candidate_indices_buffer=torch.zeros(8, 2),
+        candidate_lengths_buffer=torch.zeros(8),
+        topk_lengths_buffer=torch.zeros(8),
     )
     config = SimpleNamespace(
         cache_config=SimpleNamespace(swa_bounded_replay=True, enable_prefix_caching=True),
@@ -37,8 +39,8 @@ def test_decoder_replay_requires_mrv2_with_prefix_caching(use_v2):
         lora_config=None,
     )
     replay = replay_mod.make_decoder_replay(model, config)
-    assert (replay is not None) == use_v2
-    assert model.decoder_replay_start == (1 if use_v2 else 3)
+    assert replay is not None
+    assert model.decoder_replay_start == 1
 
 
 def test_replay_scatter_preserves_row_zero_with_padding(monkeypatch):
@@ -91,6 +93,8 @@ def test_model_replays_only_layers_after_kv_sources(monkeypatch):
     model.layers = [Layer(i) for i in range(3)]
     model.norm = lambda hidden: hidden
     model.end_layer = 3
+    model.start_layer = 0
+    model.needs_moe_input_ids = False
     model.decoder_replay_start = 1
     model.aux_hidden_state_layers = (1, 3)
     replay = replay_mod.AscendDecoderReplayLayers(2, model._run_replay_layers, [])

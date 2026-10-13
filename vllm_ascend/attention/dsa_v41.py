@@ -88,6 +88,15 @@ def _config_value(config: Any, name: str, default: Any = None) -> Any:
     return getattr(config, name, default)
 
 
+def resolve_replay_start(prefix_start: torch.Tensor | None, decoder_start: torch.Tensor | None) -> torch.Tensor | None:
+    """Use the stricter cache visibility floor when replay paths compose."""
+    if prefix_start is None:
+        return decoder_start
+    if decoder_start is None:
+        return prefix_start
+    return torch.maximum(prefix_start, decoder_start)
+
+
 def build_replay_swa_visible_lens(
     window_size: int,
     query_start_loc: torch.Tensor,
@@ -1146,10 +1155,11 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
         index_topk = int(_config_value(text_config, "index_topk"))
         ori_sparse_indices = kwargs.get("ori_sparse_indices")
         ori_topk_length = None
-        replay_start = kwargs.get("replay_start")
+        decoder_replay_start = kwargs.get("replay_start")
+        replay_start = resolve_replay_start(getattr(common, "replay_start", None), decoder_replay_start)
         replay_seq_lens = replay_block_table = replay_cache_blocks = replay_cache_offsets = None
         max_ori_seq_len = int(getattr(common, "max_seq_len", 0))
-        if replay_start is not None:
+        if decoder_replay_start is not None:
             replay_seq_lens = (seq_lens - replay_start).clamp_min(0)
             max_ori_seq_len = kwargs["replay_max_seq_len"]
             if cache_kind == "swa":
@@ -1167,7 +1177,7 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                     num_reqs * blocks_per_req, dtype=torch.int32, device=seq_lens.device
                 ).view(num_reqs, blocks_per_req)
         noncausal = not bool(getattr(common, "causal", True))
-        if replay_start is not None and self._uses_a5_packed_cache and cache_kind == "swa":
+        if replay_start is not None and self._uses_a5_packed_cache and cache_kind == "swa" and not noncausal:
             # Packed attention uses explicit logical indices. Decoder replay
             # writes no SWA KV below this floor, so do not publish those keys.
             ori_sparse_indices, ori_topk_length = build_decoder_replay_swa_indices(
@@ -1237,9 +1247,8 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
         # ``_forward_attention`` reads the mask and this length from
         # ``metadata.swa`` whichever group's loop ranges it was handed, and those
         # ranges come from the same band -- so they stay a superset of the window.
-        replay_start = getattr(common, "replay_start", None)
         replay_visible_lens = None
-        if replay_start is not None and cache_kind == "swa":
+        if replay_start is not None and cache_kind == "swa" and ori_sparse_indices is None:
             replay_visible_lens = build_replay_swa_visible_lens(
                 window_size,
                 common.query_start_loc[: num_reqs + 1],

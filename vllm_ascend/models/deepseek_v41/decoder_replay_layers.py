@@ -12,14 +12,12 @@ from vllm.logger import logger
 
 from vllm_ascend.utils import enable_dsa_cp
 
-from .decoder_replay_compat import DecoderReplayLayers
-
 if TYPE_CHECKING:
     from .model import DeepseekV41Model
 
 
 class AscendDecoderReplayLayers:
-    """Gather and scatter the MRV2 decoder sub-batch, including sharded states."""
+    """Gather and scatter the decoder sub-batch, including sharded states."""
 
     def __init__(
         self,
@@ -96,9 +94,7 @@ def make_decoder_replay(model: "DeepseekV41Model", config: VllmConfig) -> Ascend
     cut = max(model.config.kv_source_layer_ids)
     if cut >= model.end_layer - 1:
         return None
-    if config.cache_config.enable_prefix_caching:
-        reason = "encoder-side prefix replay is required when prefix caching is enabled"
-    elif (
+    if (
         (model.use_sequence_parallel and not enable_dsa_cp())
         or parallel.pipeline_parallel_size > 1
         or parallel.prefill_context_parallel_size > 1
@@ -126,7 +122,7 @@ def make_decoder_replay(model: "DeepseekV41Model", config: VllmConfig) -> Ascend
     else:
         model.decoder_replay_start = cut + 1
         logger.info_once(
-            "Ascend MRV2 decoder bounded replay: layers %d-%d keep each prefill's last %d tokens.",
+            "Ascend decoder bounded replay: layers %d-%d keep each prefill's last %d tokens.",
             cut + 1,
             model.end_layer - 1,
             model.config.sliding_window,

@@ -323,7 +323,7 @@ class NPUPlatform(Platform):
         # so we need to add "ascend" quantization method to quantization methods list
         # and the user can enable quantization using "vllm serve --quantization ascend".
         if parser is not None:
-            from vllm_ascend.patch.platform.patch_swa_bounded_replay_legacy import register_legacy_replay_argument
+            from vllm_ascend.patch.platform.patch_swa_bounded_replay import register_legacy_replay_argument
 
             register_legacy_replay_argument(parser)
             quant_action = parser._option_string_actions.get("--quantization")

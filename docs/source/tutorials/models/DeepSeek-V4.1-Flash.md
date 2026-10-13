@@ -850,36 +850,26 @@ For common environment, installation, and parameter issues, refer to the
 - Production performance qualification and task-level accuracy evaluation are
   not complete.
 
-## 12 Bounded Replay Compatibility for vLLM 0.30.0
+## 12 vLLM 0.30.0 的 bounded replay 兼容支持
 
-For vLLM 0.30.0 images without the upstream replay protocol, the Ascend plugin
-backports configuration, request payloads, and local prefix-hit admission logic.
-Installed vLLM files and compiled operators remain unchanged. The compatibility
-path is disabled by default. Enable it explicitly with:
+在未包含上游 replay 协议的 vLLM 0.30.0 镜像中，Ascend 插件回移配置、请求载荷和本地前缀命中调度逻辑。
+镜像中的 vLLM 文件和已编译算子保持不变。此兼容路径默认关闭，通过以下参数显式开启：
 
 ```shell
 --enable-prefix-caching --swa-bounded-replay
 ```
 
-Use `--no-swa-bounded-replay` to disable replay explicitly. vLLM builds with
-native replay use the upstream implementation. Compatibility is detected from
-the replay interfaces rather than a version string. Configuration and wire
-fields are registered before use; scheduler and cache behavior is patched only
-when replay is enabled. Unsupported scheduler source bodies fail explicitly.
-The backport supports local prefix caching only; enabling replay with a KV
-connector raises an error. Existing replay restrictions still apply to PCP and
-Ascend modes that use independent scheduler copies.
+显式关闭使用 `--no-swa-bounded-replay`。已具备原生 replay 协议的 vLLM 使用上游实现。
+该回移仅支持本地前缀缓存；开启 replay 时配置 KV connector 会明确报错。
+PCP 和使用独立调度器副本的 Ascend 模式仍受已有 replay 限制约束。
 
-SWA caches do not participate in prefix reuse. After a hit in another cache
-group, the scheduler recomputes the final SWA window of the cached prefix.
-The worker masks writes to shared cache groups during replay and clamps the
-visible SWA range. Hits no longer than the window are recomputed in full.
-After preemption, readmission recalculates and forwards the replay boundary.
+SWA 缓存不参与前缀复用。命中其他缓存组后，调度器重算命中前缀的末尾 SWA 窗口，
+worker 屏蔽共享缓存组在重算区间的写入，并裁剪 SWA 的可见范围。
+不超过窗口长度的命中会完整重算。抢占后重新入队时，调度器重新计算并传递 replay 边界。
 
-### 12.1 Real-Weight Validation
+### 12.1 真权重验证命令
 
-The following A5 regression configuration uses TP1/DP4/EP4. Use the existing
-CANN environment and compiled Ascend operators before running it:
+以下为 A5 的 TP1/DP4/EP4 回归配置，运行前使用已有 CANN 环境和已编译 Ascend 算子：
 
 ```shell
 cd /workspace
@@ -896,8 +886,7 @@ VLLM_USE_V2_MODEL_RUNNER=1 vllm serve /home/weights/deepseek-ai--DeepSeek-V4.1-F
   --safetensors-load-strategy lazy --additional-config '{"enable_cpu_binding":false}'
 ```
 
-First save a baseline from a replay-disabled service, then send the same
-requests to a replay-enabled service:
+先用关闭 replay 的服务保存对照，再对开启后的服务执行相同请求：
 
 ```shell
 cd /path/to/vllm-ascend
@@ -905,28 +894,40 @@ python tests/e2e/models/swa_bounded_replay_probe.py \
   --base-url http://127.0.0.1:8011 --model deepseek-v41-accuracy \
   --output /tmp/replay-disabled.json
 
-# Restart the service with --swa-bounded-replay before running this command.
+# 重启服务，显式传入 --swa-bounded-replay 后执行。
 python tests/e2e/models/swa_bounded_replay_probe.py \
   --base-url http://127.0.0.1:8011 --model deepseek-v41-accuracy \
   --baseline /tmp/replay-disabled.json --output /tmp/replay-enabled.json
 ```
 
-Validation requires successful HTTP requests, outputs matching the baseline,
-and an actual `SWA bounded replay is active` message in the service log.
-Startup success or a true configuration field alone does not prove replay was
-exercised. Cross-chunk regression should also use a token budget smaller than
-the SWA window.
+验收需要同时确认 HTTP 请求成功、输出与对照一致，以及服务日志中实际出现
+`SWA bounded replay is active`。仅启动成功或配置字段为真不足以证明已执行 replay。
+跨 chunk 回归还应使用小于 SWA 窗口的调度预算。
 
-### 12.2 Historical Validation Scope
+### 12.2 已验证范围
 
-On October 11, 2026, the A5 configuration with vLLM 0.30.0, V2 runner,
-eager execution, and TP1/DP4/EP4 recorded the following results:
+2026-10-11 在 A5、vLLM 0.30.0、V2 runner、eager、TP1/DP4/EP4 配置下：
 
-- 161 compatibility, cache allocation, worker, and attention regression tests passed.
-- All 24 real-weight requests succeeded and matched the replay-disabled baseline
-  in text and finish reason. The long prefix contained 6618 tokens, and all four
-  DP ranks logged actual SWA window replay.
-- Hashes of 2480 image vLLM Python files and six reused operator libraries were unchanged.
+- 兼容协议、缓存分配及 worker/attention 回归测试共 161 项通过。
+- 真权重 E2E 共 24 次请求成功，文本和结束原因与关闭 replay 的对照一致。
+  长前缀为 6618 tokens，4 个 DP rank 均记录了实际 SWA 窗口 replay。
+- 2480 个镜像 vLLM Python 文件及 6 个复用算子库的哈希均未变化。
 
-These historical results do not validate this merged revision and do not cover
-ACL Graph, KV connectors, MTP, or other parallel configurations.
+这些验证不覆盖 ACL Graph、KV connector、MTP 或其他并行配置。
+
+### 12.3 前缀缓存与 decoder replay 的组合
+
+同时传入 `--enable-prefix-caching --swa-bounded-replay` 时，前缀命中回退与
+decoder token 裁剪分别执行。V1/V2 runner 将两者的可见下界取最大值，
+SWA 缓存映射、稀疏索引和有效长度使用同一边界，避免读取尚未重建的 KV。
+
+vLLM 0.30 的配置、调度和请求载荷兼容集中在
+`patch/platform/patch_swa_bounded_replay.py`；decoder 的子批次执行由
+`AscendDecoderReplayLayers` 负责，不依赖额外的上游兼容 helper。
+
+CPU 回归覆盖组合下界、未裁剪 chunk 的前缀保护、索引长度一致性以及
+metadata 边界传递。2026-10-12 在 12.1 的 A5、V2 eager、TP1/DP4/EP4 配置下，
+组合路径通过 159 项 CPU 回归、5 项单卡 NPU 测试及 24 次真权重请求对照。
+6618-token 长前缀的重复请求与关闭 replay 的对照文本和结束原因一致。
+4 个 DP rank 均记录实际前缀命中重放和 decoder 的 `218 -> 128` token 裁剪。
+这次验证未包含组合路径的完整 AISBench 精度、V1 真权重或 ACL Graph 测试。

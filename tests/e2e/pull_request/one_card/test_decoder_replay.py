@@ -24,7 +24,6 @@ def test_decoder_replay_gather_preserves_slots_and_prefix_floor():
         query,
         dropped,
         seq_lens,
-        encoder_start,
         positions,
         source_slots,
         rows,
@@ -34,6 +33,7 @@ def test_decoder_replay_gather_preserves_slots_and_prefix_floor():
         starts,
         12,
         2,
+        encoder_replay_start=encoder_start,
     )
 
     retained = torch.tensor([0, 5, 6, 7, 8, 9, 10, 11, 12], device=device)

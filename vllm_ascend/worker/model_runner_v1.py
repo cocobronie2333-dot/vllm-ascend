@@ -275,6 +275,7 @@ from vllm_ascend.attention.dsa_v41 import (
     AscendDSAV41Metadata,
     AscendDSAV41MetadataBuilder,
     DeepseekV41CacheLayer,
+    resolve_replay_start,
 )
 from vllm_ascend.core.kv_cache_interface import (
     AscendIndexerKPoolTailSpec,
@@ -974,7 +975,6 @@ class NPUModelRunner(GPUModelRunner):
         )
         # Routing capture assumes padding is at the end of the full DP batch,
         # not inside each SP shard after MC2 prepare.
-        needs_uniform_routing_capture = self.vllm_config.aux_output_config.enable_return_routed_experts
         # Graph replay, these MoE paths and cross-DP fine-grained TP require
         # uniform runner inputs.
         # Draft models retain their padding until their communication policy
@@ -3511,10 +3511,15 @@ class NPUModelRunner(GPUModelRunner):
             num_tokens,
             layers.window,
         )
+        effective_start = resolve_replay_start(
+            getattr(original, "replay_start", None), self._decoder_replay_start[:num_reqs]
+        )
+        self._decoder_replay_start[:num_reqs].copy_(effective_start)
         common = original.replace(
             query_start_loc=self._decoder_replay_offsets.gpu[: num_reqs + 1],
             query_start_loc_cpu=self._decoder_replay_offsets.cpu[: num_reqs + 1],
             seq_lens=original.seq_lens[:num_reqs],
+            replay_start=self._decoder_replay_start[:num_reqs],
             num_reqs=num_reqs,
             num_actual_tokens=self._decoder_replay_num_actual_tokens,
             num_input_tokens=num_tokens,

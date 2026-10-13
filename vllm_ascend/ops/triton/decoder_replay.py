@@ -12,6 +12,7 @@ def _gather_replay_batch_kernel(
     query_start_loc,
     dropped_before,
     seq_lens,
+    encoder_replay_start,
     positions,
     slot_mappings,
     source_slot_stride: tl.constexpr,
@@ -25,6 +26,7 @@ def _gather_replay_batch_kernel(
     WINDOW: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
     BLOCK: tl.constexpr,
+    HAS_ENCODER_REPLAY: tl.constexpr,
 ):
     req = tl.program_id(0)
     begin = tl.load(query_start_loc + req)
@@ -38,6 +40,8 @@ def _gather_replay_batch_kernel(
     # Untrimmed requests also need the preceding window for their queries.
     history = tl.where(kept_len < end - begin, 0, WINDOW - 1)
     replay_start = tl.maximum(tl.load(seq_lens + req) - kept_len - history, 0)
+    if HAS_ENCODER_REPLAY:
+        replay_start = tl.maximum(replay_start, tl.load(encoder_replay_start + req))
     tl.store(replay_start_out + req, replay_start)
 
     first_row = end - kept_len
@@ -79,6 +83,7 @@ def gather_replay_batch(
     window: int,
     *,
     warmup: bool = False,
+    encoder_replay_start: torch.Tensor | None = None,
 ) -> None:
     """Gather a replay batch into caller-owned buffers for either model runner.
 
@@ -93,6 +98,7 @@ def gather_replay_batch(
         query_start_loc,
         dropped_before,
         seq_lens,
+        encoder_replay_start,
         positions,
         slot_mappings,
         slot_mappings.stride(0),
@@ -106,6 +112,7 @@ def gather_replay_batch(
         WINDOW=window,
         NUM_GROUPS=slot_mappings.shape[0],
         BLOCK=REPLAY_BLOCK_SIZE,
+        HAS_ENCODER_REPLAY=encoder_replay_start is not None,
         grid=(query_start_loc.numel() - 1,),
         warmup=warmup,
     )

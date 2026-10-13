@@ -13,6 +13,49 @@ from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config, set_
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
 
 
+def test_decoder_metadata_preserves_prefix_floor():
+    state = AscendModelState.__new__(AscendModelState)
+    state.decoder_replay = SimpleNamespace(window=32)
+    state._decoder_replay_num_tokens = state._decoder_replay_num_actual_tokens = 16
+    state._decoder_replay_dropped_before = SimpleNamespace(copy_to_gpu=lambda size: None, gpu=torch.zeros(2))
+    state._decoder_replay_offsets = SimpleNamespace(
+        gpu=torch.tensor([0, 16]), cpu=torch.tensor([0, 16]), np=np.array([0, 16])
+    )
+    state._decoder_replay_start = torch.empty(1, dtype=torch.int32)
+    state._decoder_replay_rows = torch.empty(16, dtype=torch.int64)
+    state._decoder_replay_positions = torch.arange(64, 80)
+    state._decoder_replay_source_slot_mappings = torch.empty((1, 16), dtype=torch.int64)
+    state._decoder_replay_slot_mappings = torch.empty((1, 16), dtype=torch.int64)
+    state.slot_mappings = [torch.arange(16)]
+    state.block_tables = [torch.zeros((1, 8), dtype=torch.int32)]
+    original = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 16]),
+        seq_lens=torch.tensor([80]),
+        positions=torch.arange(64, 80),
+        is_prefilling=torch.tensor([True]),
+        replay_start=torch.tensor([64]),
+    )
+    state._decoder_replay_common_metadata = {0: original}
+    builder = Mock()
+    state._decoder_replay_builders = [(0, ["layer"], builder)]
+
+    def gather(*args):
+        # This untrimmed chunk would otherwise admit unwritten history at 33.
+        args[9].fill_(33)
+
+    with (
+        patch("vllm_ascend.ops.triton.decoder_replay.gather_replay_batch", side_effect=gather),
+        patch("vllm_ascend.ops.rope_dsv4.get_cos_and_sin_dsa", return_value=None),
+        patch(
+            "vllm_ascend.worker.v2.model_states.default.replace",
+            side_effect=lambda obj, **kwargs: SimpleNamespace(**(vars(obj) | kwargs)),
+        ),
+    ):
+        state._build_decoder_replay_metadata(SimpleNamespace(num_tokens=16), np.array([16]))
+    assert builder.build.call_args.kwargs["replay_start"].tolist() == [64]
+    assert builder.build.call_args.args[1].replay_start.tolist() == [64]
+
+
 @pytest.mark.parametrize("raises", [False, True])
 def test_replay_context_continues_moe_layer_cursor(raises):
     state = AscendModelState.__new__(AscendModelState)

@@ -78,7 +78,6 @@ class DecoderReplayState:
             batch.query_start_loc[: batch.num_reqs + 1],
             self.dropped_before.gpu[: batch.num_reqs + 1],
             batch.seq_lens,
-            inputs.encoder_replay_start,
             batch.positions,
             inputs.slot_mappings,
             self.rows,
@@ -89,6 +88,7 @@ class DecoderReplayState:
             self.num_tokens,
             self.layers.window,
             warmup=warmup,
+            encoder_replay_start=inputs.encoder_replay_start,
         )
 
     def prepare(self, inputs: DecoderReplayInputs, mode: CUDAGraphMode, *, for_capture: bool = False) -> None:
@@ -189,6 +189,7 @@ class DecoderReplayState:
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
             ):
                 context = get_forward_context()
+                context.moe_layer_index = outer.moe_layer_index
                 context.additional_kwargs["eplb_heat_collection_status"] = outer.additional_kwargs.get(
                     "eplb_heat_collection_status", False
                 )
@@ -205,6 +206,7 @@ class DecoderReplayState:
                         tp = get_tp_group()
                         context.is_padding = context.is_padding.chunk(tp.world_size)[tp.rank_in_group]
                 yield
+                outer.moe_layer_index = context.moe_layer_index
         finally:
             if saved_mask is not None:
                 mask.copy_(saved_mask)

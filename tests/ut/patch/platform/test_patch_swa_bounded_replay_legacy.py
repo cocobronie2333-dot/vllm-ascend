@@ -44,7 +44,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCache
 from vllm.v1.request import Request
 
 from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec, register_ascend_kv_cache_specs
-from vllm_ascend.patch.platform.patch_swa_bounded_replay_legacy import (
+from vllm_ascend.patch.platform.patch_swa_bounded_replay import (
     _mark_prefix_replay,
     _patch_scheduler,
     _rewrite_method,

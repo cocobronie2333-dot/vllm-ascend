@@ -289,11 +289,18 @@ class AscendModelState(DefaultModelState):
             num_tokens,
             self.decoder_replay.window,
         )
+        from vllm_ascend.attention.dsa_v41 import resolve_replay_start
+
+        effective_start = resolve_replay_start(
+            getattr(original, "replay_start", None), self._decoder_replay_start[:num_reqs]
+        )
+        self._decoder_replay_start[:num_reqs].copy_(effective_start)
         common = replace(
             original,
             query_start_loc=self._decoder_replay_offsets.gpu[: num_reqs + 1],
             query_start_loc_cpu=self._decoder_replay_offsets.cpu[: num_reqs + 1],
             seq_lens=original.seq_lens[:num_reqs],
+            replay_start=self._decoder_replay_start[:num_reqs],
             num_reqs=num_reqs,
             num_actual_tokens=self._decoder_replay_num_actual_tokens,
             num_input_tokens=num_tokens,

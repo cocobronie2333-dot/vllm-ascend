@@ -102,10 +102,17 @@ def test_dsa_cp_pads_replay_without_adding_actual_rows(state, monkeypatch):
 def test_request_reuse_refreshes_prompt_logprob_retention(state, monkeypatch, prompt_logprobs):
     monkeypatch.setattr(AscendModelState, "add_request", lambda *args: None)
     model_state = EngramModelState.__new__(EngramModelState)
-    model_state.decoder_replay = state
+    model_state.decoder_replay_state = state
     model_state._replay_start_np = np.zeros(4, dtype=np.int32)
     state.keeps_rows[1] = True
     request = SimpleNamespace(replay_start=7, sampling_params=SimpleNamespace(prompt_logprobs=prompt_logprobs))
     model_state.add_request(1, request)
     assert state.keeps_rows[1] == (prompt_logprobs is not None)
     assert model_state._replay_start_np[1] == 7
+
+
+def test_engram_disables_duplicate_base_replay():
+    model_state = EngramModelState.__new__(EngramModelState)
+    model_state.decoder_replay = object()
+    model_state._initialize_decoder_replay()
+    assert model_state.decoder_replay is None

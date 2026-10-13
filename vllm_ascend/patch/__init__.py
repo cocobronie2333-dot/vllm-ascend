@@ -776,7 +776,7 @@
 #       Remove this patch once upstream vLLM adds the terminal short-circuit
 #       to the outlines backend.
 #
-# ** 20a. File: platform/patch_swa_bounded_replay_legacy.py**
+# ** 20a. File: platform/patch_swa_bounded_replay.py (release admission)**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   Targets: CacheConfig, EngineArgs, Scheduler.schedule, KVCacheManager,
 #   NewRequestData, and SingleTypeKVCacheManager.cache_blocks.
@@ -799,7 +799,7 @@
 #       Native replay implementations are detected and left unchanged.
 #       KV connectors are rejected while this backport only supports local hits.
 #
-# ** 20b. File: platform/patch_swa_bounded_replay.py**
+# ** 20b. File: platform/patch_swa_bounded_replay.py (V1 resume)**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.core.sched.output.CachedRequestData` (new field `replay_start`)
 #   2. `vllm.v1.core.sched.scheduler.Scheduler._make_cached_request_data`
