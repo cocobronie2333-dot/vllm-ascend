@@ -31,6 +31,7 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from tests.ut.models.qwen4_exp.test_cache_config import _allocate, _make_config
 from vllm_ascend.ascend_config import FinegrainedTPConfig
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.attention.attention_c8_mxfp import (
@@ -1299,6 +1300,15 @@ def _ratio_kwargs(ratio: int) -> dict[str, int]:
 
 
 class TestNPUModelRunnerKVCache(unittest.TestCase):
+    def test_qwen_standard_cache_uses_one_backing_with_sparse_attention(self):
+        config = _make_config(num_blocks=3)
+        backings, raw, caches = _allocate(config, aligned=True)
+        self.assertEqual(len(backings), 1)
+        self.assertEqual(len(raw), 73)
+        self.assertEqual(len(caches), 73)
+        self.assertEqual(caches["model.layers.47.self_attn.attn"].shape, (3, 1, 128, 512))
+        self.assertEqual(caches["model.layers.47.self_attn.indexer.compressed_key_cache"].shape, (3, 1, 32, 128))
+
     def _build_runner(self):
         runner = NPUModelRunner.__new__(NPUModelRunner)
         runner.device = torch.device("cpu")
