@@ -18,6 +18,7 @@ from dataclasses import replace
 from typing import Protocol, TypeAlias, cast
 
 import torch
+from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.models.qwen4_exp.amd import (
@@ -30,9 +31,8 @@ from vllm.models.qwen4_exp.common.qsa_cache import (
 )
 from vllm.utils.torch_utils import (
     canonicalize_singleton_dim_strides,
-    get_dtype_size,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from vllm_ascend.ops.triton.linearnorm import qsa_rmsnorm_mrope as _qsa_rmsnorm_mrope  # noqa: F401
@@ -86,6 +86,13 @@ def _compress_qsa_groups(
     )
 
 
+class AscendQSACompressedKeyCache(qsa_cache.QSACompressedKeyCache):
+    """Identify Qwen4Exp specs before the scheduler chooses its cache planner."""
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        return replace(super().get_kv_cache_spec(vllm_config), model_version="qwen4_exp")
+
+
 class QSAForwardMetadataProtocol(Protocol):
     """Metadata fields consumed by the Ascend sparse QSA implementation."""
 
@@ -98,7 +105,17 @@ def _split_qsa_kv_cache(kv_cache: QSAKVCache, head_size: int) -> tuple[torch.Ten
         if len(kv_cache) != 2:
             raise ValueError("QSA packed cache must contain K and V views")
         return kv_cache
-    return kv_cache.transpose(1, 2).split(head_size, dim=-1)
+    # The standard descriptor binds a whole physical page. QSA owns its
+    # interpretation: planar K then V keeps tokens dense for GBSA subpages.
+    num_blocks, num_heads, num_tokens, width = kv_cache.shape
+    if width != 2 * head_size:
+        raise ValueError("QSA cache content must contain one K and one V head")
+    shape = (num_blocks, num_tokens, num_heads, head_size)
+    strides = (kv_cache.stride(0), num_heads * head_size, head_size, 1)
+    offset = kv_cache.storage_offset()
+    key = kv_cache.as_strided(shape, strides, offset)
+    value = kv_cache.as_strided(shape, strides, offset + num_tokens * num_heads * head_size)
+    return key, value
 
 
 def _qsa_cache_is_bound(kv_cache: QSAKVCache) -> bool:
@@ -445,12 +462,21 @@ class AscendQSAImpl:
         )
 
 
+class AscendQSAStateBackend(qsa_cache.QSAStateBackend):
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        return (KVCacheLayout.LBNHC,)
+
+
 class AscendQSABackend(upstream_qsa.Qwen4ExpQSAFlashAttentionBackend):
     # QSA pages are represented by descriptor-backed views. Consecutive
     # logical blocks may be separated by other cache owners in the common
     # vLLM pool, while each individual page remains dense.
     uses_descriptor_cache_view = True
-    uses_qsa_page_major_kv_view = True
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        return (KVCacheLayout.LBNHC,)
 
     @staticmethod
     def get_name() -> str:
@@ -462,43 +488,22 @@ class AscendQSABackend(upstream_qsa.Qwen4ExpQSAFlashAttentionBackend):
 
     @classmethod
     def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
-        """Store main K/V in two page-major slots of one descriptor page."""
-        if spec.head_size != spec.head_size_v:
-            raise ValueError("QSA page-major K/V slots require symmetric head sizes")
-        slot_bytes = spec.num_kv_heads * spec.head_size * get_dtype_size(spec.dtype)
-        if spec.num_head_slots == 2 and spec.state_content_bytes == slot_bytes:
-            return spec
-        return replace(
-            spec,
-            num_head_slots=2,
-            state_content_bytes=slot_bytes,
-        )
-
-    @classmethod
-    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
-        return (KVCacheLayout.BLNHC, KVCacheLayout.BLHNC)
+        """Keep dense K/V specs; the standard LBNHC planner pads physical pages."""
+        return spec
 
 
 # The upstream owner resolves these names from its module globals during
 # construction. Replace only the platform-specific components, leaving model
-# structure, cache specifications and weight mapping in upstream vLLM.
+# structure, cache geometry and weight mapping in upstream vLLM.
+qsa_cache.QSAStateBackend = AscendQSAStateBackend
+upstream_indexer.QSACompressedKeyCache = AscendQSACompressedKeyCache
 upstream_indexer.apply_qsa_rope = apply_qsa_rope
 upstream_qsa.QSAIndexer = AscendQSAIndexer
 upstream_qsa.Qwen4ExpQSAFlashAttentionImpl = AscendQSAImpl
 upstream_qsa.Qwen4ExpQSAFlashAttentionBackend = AscendQSABackend
 
 
-def _ascend_qsa_state_cache_layouts(
-    cls,
-) -> tuple[KVCacheLayout, ...]:
-    del cls
-    return (KVCacheLayout.BLNHC, KVCacheLayout.BLHNC)
-
-
-# Side-cache descriptors use the same block-outermost layout as main QSA KV.
-# Their physical block stride is honored by the runner, so no compact copy is
-# required before LightningIndexer or the Triton QSA selector consumes them.
-qsa_cache.QSAStateBackend.supported_kv_cache_layouts = classmethod(_ascend_qsa_state_cache_layouts)
+# State views retain the physical page stride without a compact copy.
 qsa_cache.QSAStateBackend.uses_descriptor_cache_view = True
 
 
