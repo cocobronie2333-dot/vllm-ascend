@@ -816,8 +816,9 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         if self.group_uses_align_state[group_id]:
             # Recurrent state is valid at exactly the saved endpoint.
             return snapshot.key if snapshot.end_token == cached_tokens else None
-        block_end = (block_idx + 1) * self.grouped_block_size[group_id]
-        return snapshot.key if snapshot.end_token >= min(block_end, cached_tokens) else None
+        block_end_token = (block_idx + 1) * self.grouped_block_size[group_id]
+        required_end_token = min(block_end_token, cached_tokens)
+        return snapshot.key if snapshot.end_token >= required_end_token else None
 
     def _layerwise_key_batches(self, keys: list[str]) -> list[list[str]]:
         batch_size = self.layerwise_max_transfer_blocks if self.layerwise_max_transfer_blocks > 0 else max(1, len(keys))
