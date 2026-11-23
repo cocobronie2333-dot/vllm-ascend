@@ -3,6 +3,7 @@
 import unittest
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.metadata import LayerwiseSnapshot
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.pool_worker import LayerwiseKVPoolWorker
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import ReqMeta
 
@@ -11,8 +12,14 @@ class TestReuseSnapshotIdentity(unittest.TestCase):
     def test_previous_step_uses_public_hash_and_request_local_tail_key(self):
         worker = LayerwiseKVPoolWorker.__new__(LayerwiseKVPoolWorker)
         worker.grouped_block_size = [128, 128]
+        worker.group_uses_align_state = [False, False]
         worker._reused_layers_by_group = {0: {1}, 1: {1}}
-        worker._snapshot_keys = {"request": {0: {0: "old-private", 1: "tail"}, 1: {1: "other-group"}}}
+        worker._snapshot_keys = {
+            "request": {
+                0: {0: LayerwiseSnapshot("old-private", 128), 1: LayerwiseSnapshot("tail", 129)},
+                1: {1: LayerwiseSnapshot("other-group", 129)},
+            }
+        }
         worker._make_layerwise_full_key = lambda group, block_hash: f"full:{group}:{block_hash}"
         request = ReqMeta("request", target_token_len=131)
         snapshot = worker._get_layerwise_load_snapshot(request, 0, 129, [b"\xab"])

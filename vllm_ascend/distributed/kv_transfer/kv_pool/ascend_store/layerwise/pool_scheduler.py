@@ -89,8 +89,14 @@ class LayerwiseKVPoolScheduler(BaseKVPoolScheduler):
     ) -> ReqMeta | None:
         request_tuple = self._unfinished_requests.get(request_tracker.req_id)
         if self.layerwise_offload and request_tuple is not None:
-            # Verifier rows have no corresponding input KV or state to snapshot.
-            request_tracker.token_len = min(request_tracker.token_len, len(request_tuple[0].all_token_ids))
+            request = request_tuple[0]
+            available_input_tokens = len(request.all_token_ids)
+            if self.vllm_config.speculative_config is None:
+                # The worker can consume a sampled token before async output
+                # processing appends it to the scheduler's token IDs.
+                available_input_tokens += request.num_output_placeholders
+            # With speculation, placeholders can still represent verifier rows.
+            request_tracker.token_len = min(request_tracker.token_len, available_input_tokens)
         return super()._build_req_meta(request_tracker, block_hashes, load_spec, prompt_token_ids, skip_save)
 
     def get_running_target_token_len(self, request: Request, num_new_tokens: int) -> int:

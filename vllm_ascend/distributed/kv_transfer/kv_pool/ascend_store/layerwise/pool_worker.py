@@ -54,6 +54,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.metadata
     LayerBlockRange,
     LayerLoadTask,
     LayerTransferTask,
+    LayerwiseSnapshot,
     SharedBlockData,
     get_partial_block_index,
     masked_block_runs,
@@ -113,8 +114,8 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         self.use_layerwise_transfer = self.layerwise_data_plane == "gva"
         self.has_shared_kv = self.use_layerwise_transfer and has_shared_kv_sources(vllm_config)
         self._step_load_keys: set[str] = set()
-        # Request ID -> cache group ID -> request block index -> private pool key.
-        self._snapshot_keys: dict[str, dict[int, dict[int, str]]] = {}
+        # Request ID -> cache group ID -> request block index -> private snapshot.
+        self._snapshot_keys: dict[str, dict[int, dict[int, LayerwiseSnapshot]]] = {}
         super()._init_kv_transfer_config(vllm_config, extra_config, use_layerwise, kv_cache_config)
         self.block_key_hybrid = self.use_block_key_layerwise and self.use_hybrid
         self._dspark_draft_layer_names = (
@@ -790,20 +791,33 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
             return None
 
         full_blocks = num_computed_tokens // self.grouped_block_size[group_id]
-        snapshot = self._snapshot_keys.get(request.req_id, {}).get(group_id, {})
 
         def get_saved_key(block_idx: int) -> tuple[str, bool] | None:
             """Return the pool key and whether it is public."""
             if block_idx < full_blocks and block_idx < len(block_hashes):
                 block_hash = block_hash_to_str(block_hashes[block_idx])
                 return self._make_layerwise_full_key(group_id, block_hash), True
-            private_key = snapshot.get(block_idx)
+            private_key = self._get_layerwise_private_snapshot_key(
+                request.req_id, group_id, block_idx, num_computed_tokens
+            )
             if private_key is not None:
                 return private_key, False
             logger.error("No saved KV page for request %s group %d block %d", request.req_id, group_id, block_idx)
             return None
 
         return full_blocks, get_saved_key
+
+    def _get_layerwise_private_snapshot_key(
+        self, req_id: str, group_id: int, block_idx: int, cached_tokens: int
+    ) -> str | None:
+        snapshot = self._snapshot_keys.get(req_id, {}).get(group_id, {}).get(block_idx)
+        if snapshot is None:
+            return None
+        if self.group_uses_align_state[group_id]:
+            # Recurrent state is valid at exactly the saved endpoint.
+            return snapshot.key if snapshot.end_token == cached_tokens else None
+        block_end = (block_idx + 1) * self.grouped_block_size[group_id]
+        return snapshot.key if snapshot.end_token >= min(block_end, cached_tokens) else None
 
     def _layerwise_key_batches(self, keys: list[str]) -> list[list[str]]:
         batch_size = self.layerwise_max_transfer_blocks if self.layerwise_max_transfer_blocks > 0 else max(1, len(keys))

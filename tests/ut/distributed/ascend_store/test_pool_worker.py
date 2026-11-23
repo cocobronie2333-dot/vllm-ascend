@@ -49,6 +49,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.kv_trans
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.metadata import (
     LayerBlockRange,
     LayerTransferTask,
+    LayerwiseSnapshot,
     SharedBlockData,
     get_partial_block_index,
 )
@@ -2714,7 +2715,12 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
         worker = self._make_gva_worker(2)
         worker.grouped_block_size = [16, 32]
         worker._reused_layers_by_group = {0: {0}, 1: {1}}
-        worker._snapshot_keys = {"grouped-load": {0: {2: "snapshot-group-0"}, 1: {1: "snapshot-group-1"}}}
+        worker._snapshot_keys = {
+            "grouped-load": {
+                0: {2: LayerwiseSnapshot("snapshot-group-0", 40)},
+                1: {1: LayerwiseSnapshot("snapshot-group-1", 40)},
+            }
+        }
         request = ReqMeta(
             req_id="grouped-load",
             token_len_chunk=16,
@@ -2904,7 +2910,8 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
         request.target_token_len = 56
         request.load_spec = LoadSpec(40, 40, True, layerwise_previous_step=True)
         worker._reused_layers_by_group = {0: {1}}
-        worker._snapshot_keys[request.req_id] = {0: {2: worker._make_layerwise_partial_key(request, 0, 2, 40)}}
+        partial_key = worker._make_layerwise_partial_key(request, 0, 2, 40)
+        worker._snapshot_keys[request.req_id] = {0: {2: LayerwiseSnapshot(partial_key, 40)}}
         before = [SimpleNamespace(size=lambda: 64, gva_list=lambda gva=gva: [gva]) for gva in (201, 202, 203)]
         pinned = [SimpleNamespace(gva_list=lambda gva=gva: [gva]) for gva in (301, 302, 303)]
         worker.m_store.batch_get_key_info.side_effect = [before[:2], pinned[:2], before[2:], pinned[2:]]
@@ -3091,11 +3098,8 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
             block_ids_by_group_np=[np.asarray([7, 8], dtype=np.int64)],
         )
         partial_key = worker._make_layerwise_partial_key(request, 0, 1, 20)
-        worker._snapshot_keys = {request.req_id: {0: {1: partial_key}}}
-
-        partial_key = worker._make_layerwise_partial_key(request, 0, 1, 20)
         worker._reused_layers_by_group = {0: {1}}
-        worker._snapshot_keys[request.req_id] = {0: {1: partial_key}}
+        worker._snapshot_keys[request.req_id] = {0: {1: LayerwiseSnapshot(partial_key, 20)}}
         with patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.planes.gva.time.sleep") as sleep:
             worker._data_plane._prepare_load_gvas([request])
 
@@ -4010,7 +4014,7 @@ class TestKVPoolWorkerReachableMasks(unittest.TestCase):
                     block_ids_by_group_np=[np.asarray(ids, dtype=np.int64) for ids in block_ids],
                     load_spec=LoadSpec(cached_tokens, cached_tokens, True, layerwise_previous_step=True),
                 )
-                worker._snapshot_keys[request.req_id] = {1: {1: "private"}}
+                worker._snapshot_keys[request.req_id] = {1: {1: LayerwiseSnapshot("private", cached_tokens)}}
                 selected_key = lookup_keys[-1]
                 available = {selected_key: SimpleNamespace(size=lambda: 64, gva_list=lambda: [201])}
                 queries: list[list[str]] = []

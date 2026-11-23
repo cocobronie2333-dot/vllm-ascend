@@ -14,6 +14,7 @@ import numpy as np
 from vllm.logger import logger
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.metadata import (
+    LayerwiseSnapshot,
     get_partial_block_index,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.planes.base import (
@@ -212,10 +213,10 @@ class GvaDataPlane(LayerwiseDataPlane):
                         if block_idx < len(group_block_hashes):
                             pages.pop(block_idx, None)
                         else:
-                            pages[block_idx] = key
+                            pages[block_idx] = LayerwiseSnapshot(key, request.target_token_len)
                     if partial_key is not None:
                         assert partial_block_index is not None
-                        pages[partial_block_index] = partial_key
+                        pages[partial_block_index] = LayerwiseSnapshot(partial_key, request.target_token_len)
                 if not save_owner:
                     all_group_gvas.append(np.zeros(len(block_ids_by_group), dtype=np.int64))
                     all_group_block_ids.append(np.asarray(block_ids_by_group, dtype=np.int64))
@@ -367,9 +368,8 @@ class GvaDataPlane(LayerwiseDataPlane):
             public_keys.update(request_keys)
 
         public_gvas: dict[str, int] = {}
-        missing_keys: set[str] = set()
         for keys in self._worker._layerwise_key_batches(list(public_keys)):
-            addresses = self._lease_load_gvas(keys, missing_keys=missing_keys)
+            addresses = self._lease_load_gvas(keys)
             if addresses is not None:
                 public_gvas.update((key, gva) for key, gva in zip(keys, addresses, strict=True) if gva)
 
@@ -381,7 +381,7 @@ class GvaDataPlane(LayerwiseDataPlane):
                     if key not in request_public_keys:
                         private_keys[key] = None
                     elif key not in public_gvas:
-                        fallback = group.snapshot_fallbacks.get(index) if key in missing_keys else None
+                        fallback = group.snapshot_fallbacks.get(index)
                         if fallback is None:
                             unavailable = True
                             break
@@ -406,9 +406,7 @@ class GvaDataPlane(LayerwiseDataPlane):
                 for group in groups
             ]
 
-    def _lease_load_gvas(
-        self, keys: list[str], *, retry_private: bool = False, missing_keys: set[str] | None = None
-    ) -> list[int] | None:
+    def _lease_load_gvas(self, keys: list[str], *, retry_private: bool = False) -> list[int] | None:
         worker = self._worker
         infos = worker.m_store.batch_get_key_info(keys, for_load=True)
         if infos is None or len(infos) != len(keys):
@@ -419,8 +417,6 @@ class GvaDataPlane(LayerwiseDataPlane):
             if size and size > 0 and any(address > 0 for address in info.gva_list()):
                 readable_indices.append(index)
             else:
-                if info is None and missing_keys is not None:
-                    missing_keys.add(key)
                 logger.warning("load_gvas: key=%s has no readable GVA", key)
 
         gvas = [0] * len(keys)
@@ -567,9 +563,6 @@ class GvaDataPlane(LayerwiseDataPlane):
 
             keys: list[str] = []
             snapshot_fallbacks: dict[int, str] = {}
-            private_snapshot = (
-                worker._snapshot_keys.get(request.req_id, {}).get(group_id, {}) if restore_previous_step else {}
-            )
             if partial_block_index is not None:
                 block_indices.append(partial_block_index)
             for block_idx in block_indices:
@@ -584,8 +577,12 @@ class GvaDataPlane(LayerwiseDataPlane):
                     is_public = True
                 if is_public:
                     public_keys[key] = None
-                    if block_idx in private_snapshot:
-                        snapshot_fallbacks[len(keys)] = private_snapshot[block_idx]
+                    if restore_previous_step:
+                        fallback = worker._get_layerwise_private_snapshot_key(
+                            request.req_id, group_id, block_idx, cached_tokens
+                        )
+                        if fallback is not None:
+                            snapshot_fallbacks[len(keys)] = fallback
                 keys.append(key)
             groups.append(
                 _LoadGroup(

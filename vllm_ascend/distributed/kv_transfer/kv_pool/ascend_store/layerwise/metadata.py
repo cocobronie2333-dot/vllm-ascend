@@ -45,6 +45,12 @@ class LayerPoolKey(PoolKey):
         )
 
 
+@dataclass(frozen=True)
+class LayerwiseSnapshot:
+    key: str
+    end_token: int
+
+
 def get_partial_block_index(
     token_count: int,
     block_size: int,

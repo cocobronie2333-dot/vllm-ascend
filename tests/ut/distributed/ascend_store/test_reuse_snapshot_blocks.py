@@ -130,7 +130,7 @@ class SnapshotTests(unittest.TestCase):
         w._process_load_for_layer_batch([m], 1)
         self.assertEqual(transferred(w, False), saved)
         self.assertIn("full:h0", w.m_store.queries)
-        self.assertIn(w._snapshot_keys[t.req_id][0][0], w.m_store.queries)
+        self.assertIn(w._snapshot_keys[t.req_id][0][0].key, w.m_store.queries)
         save(w, m)
         self.assertIn("full:h0", w.m_store.committed)
         self.assertNotIn(0, w._snapshot_keys[t.req_id][0])
@@ -141,6 +141,51 @@ class SnapshotTests(unittest.TestCase):
         self.assertIn("full:h0", w.m_store.queries)
         save(w, m)
         self.assertNotIn("full:h0", m.save_keys)
+
+    def test_aligned_recurrent_restore_requires_snapshot_at_the_block_boundary(self):
+        for saved_end in (767, 768):
+            with self.subTest(saved_end=saved_end):
+                w = worker()
+                w.grouped_block_size = [768]
+                w.hash_block_size = 768
+                w.group_uses_align_state = [True]
+                tracker = RequestTracker("r", 0, allocated_block_ids_by_group=[[9, 10]])
+                tracker.token_len = saved_end
+                meta = ReqMeta.from_request_tracker(tracker, 768, save_partial_block=True)
+                saved_addresses = save(w, meta)
+                snapshot = w._snapshot_keys[tracker.req_id][0][0]
+                self.assertEqual(snapshot.end_token, saved_end)
+                reset(w)
+
+                # The hash arrives after the save, while the public key is
+                # present in the store but has no readable address yet.
+                original_lookup = w.m_store.batch_get_key_info
+
+                def lookup(keys, original_lookup=original_lookup, **kwargs):
+                    return [
+                        SimpleNamespace(size=lambda: 0, gva_list=lambda: []) if key == "full:h0" else info
+                        for key, info in zip(keys, original_lookup(keys, **kwargs), strict=True)
+                    ]
+
+                w.m_store.batch_get_key_info = lookup
+                tracker.token_len = 769
+                next_meta = ReqMeta.from_request_tracker(
+                    tracker,
+                    768,
+                    block_hashes=["h0"],
+                    load_spec=LoadSpec(768, 768, True, layerwise_previous_step=True),
+                    save_partial_block=True,
+                )
+                w._data_plane._prepare_load_gvas([next_meta])
+
+                if saved_end == 768:
+                    self.assertTrue(next_meta.load_spec.can_load)
+                    self.assertEqual(next_meta.load_keys, [snapshot.key])
+                    w._process_load_for_layer_batch([next_meta], 1)
+                    self.assertEqual(transferred(w, False), saved_addresses)
+                else:
+                    self.assertFalse(next_meta.load_spec.can_load)
+                    self.assertNotIn(snapshot.key, w.m_store.queries)
 
     def test_multiblock_snapshot_restores_the_previous_prefill_extent(self):
         for end in (128, 129, 256, 385):

@@ -1096,6 +1096,31 @@ class TestKVPoolSchedulerBuildMeta(unittest.TestCase):
         self.assertEqual(meta.requests[0].token_ids, list(range(32, 48)))
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_offload_save_includes_ordinary_async_input_before_its_hash_arrives(self, mock_client_cls):
+        for speculative, expected_end in ((False, 768), (True, 767)):
+            with self.subTest(speculative=speculative):
+                config = self._make_config(
+                    block_size=768, extra_config={"backend": "memcache", "layerwise_num_shared_buffers": 1}
+                )
+                config.speculative_config = MagicMock() if speculative else None
+                scheduler = self._make_offload_scheduler(config)
+                self._set_running_chunk(scheduler)
+                request = scheduler._unfinished_requests["r1"][0]
+                request.num_computed_tokens = 767
+                request.all_token_ids = list(range(767))
+                request.num_output_placeholders = 1
+                request.block_hashes = []
+                output = self._make_running_chunk_output([], num_computed_tokens=767)
+                output.num_scheduled_tokens = {"r1": 1}
+
+                meta = scheduler.build_connector_meta(output).requests[0]
+
+                self.assertEqual(meta.target_token_len, expected_end)
+                self.assertTrue(meta.can_save)
+                self.assertEqual(meta.save_end_token, 0)
+                self.assertEqual(meta.load_spec.kvpool_cached_tokens, 767)
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
     def test_running_chunk_reloads_prefix_with_layer_reuse(self, mock_client_cls):
         config = self._make_config(
             extra_config={
