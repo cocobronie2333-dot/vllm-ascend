@@ -26,7 +26,11 @@ from .layerwise_cache_layout import (
 )
 
 SPEC_REUSE_RULES = MappingProxyType(
-    {"glm5_next_text": "vllm_ascend.models.glm5next.cache_reuse.GLM5_NEXT_SPEC_REUSE_RULES"}
+    {
+        "glm5_next_text": "vllm_ascend.models.glm5next.cache_reuse.GLM5_NEXT_SPEC_REUSE_RULES",
+        "qwen4_exp": "vllm_ascend.models.qwen4_exp.cache_reuse.QWEN4_EXP_SPEC_REUSE_RULES",
+        "qwen4_exp_text": "vllm_ascend.models.qwen4_exp.cache_reuse.QWEN4_EXP_SPEC_REUSE_RULES",
+    }
 )
 
 
